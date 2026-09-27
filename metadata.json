@@ -1,0 +1,15 @@
+{
+  "$schema": "https://go.kicad.org/pcm/schemas/v1",
+  "name": "AI Schematic Generator",
+  "description": "Create an Eeschema draft from Word or a local Graph IR JSON file",
+  "description_full": "Uploads Word to a configurable FastAPI service or directly loads a local Graph IR v2 JSON file, resolves symbols from the active project's libraries, and places symbols and wires on the active schematic sheet.",
+  "identifier": "com.sunveda.kicad-ai-schematic-generator",
+  "type": "plugin",
+  "author": {"name": "SunvEDA contributors", "contact": {}},
+  "maintainer": {"name": "SunvEDA contributors", "contact": {}},
+  "license": "GPL-3.0",
+  "resources": {},
+  "versions": [
+    {"version": "0.1.5", "status": "development", "kicad_version": "9.0", "runtime": "ipc"}
+  ]
+}

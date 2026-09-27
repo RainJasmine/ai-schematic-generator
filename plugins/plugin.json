@@ -1,0 +1,22 @@
+{
+  "$schema": "https://go.kicad.org/api/schemas/v1",
+  "identifier": "com.sunveda.kicad-ai-schematic-generator",
+  "name": "AI Schematic Generator",
+  "description": "Upload Word or open local Graph IR JSON and draw a schematic in Eeschema",
+  "runtime": {
+    "type": "python",
+    "min_version": "3.10"
+  },
+  "actions": [
+    {
+      "identifier": "generate-schematic",
+      "name": "Generate schematic from Word or JSON",
+      "description": "Upload Word or load local Graph IR JSON, then place symbols and wires",
+      "show-button": true,
+      "scopes": ["schematic"],
+      "entrypoint": "generate_schematic.py",
+      "icons-light": ["icons/generate.png"],
+      "icons-dark": ["icons/generate_dark.png"]
+    }
+  ]
+}
