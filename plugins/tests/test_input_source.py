@@ -23,7 +23,8 @@ class InputSourceTests(unittest.TestCase):
         with patch("ai_schematic.input_source.upload_word",
                    return_value={"graph_id": "remote", "nodes": [], "edges": []}) as upload:
             graph = load_graph_input("proposal.docx", "word", "http://127.0.0.1:8000/generate")
-        upload.assert_called_once_with("proposal.docx", "http://127.0.0.1:8000/generate")
+        upload.assert_called_once_with("proposal.docx", "http://127.0.0.1:8000/generate",
+                                       token="", user_text="", run_name="", on_progress=None)
         self.assertEqual(graph.graph_id, "remote")
 
 

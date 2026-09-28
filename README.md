@@ -8,24 +8,16 @@ then launch **Generate schematic from Word or JSON** from an open schematic edit
 Choose **选择 JSON…** to load a local Graph IR v2 JSON file and generate directly;
 this route makes no HTTP request. Choose **选择 Word…** to use the AI service.
 
-The action uploads `.doc` or `.docx` as a FastAPI multipart field named `file`
-to `POST http://127.0.0.1:8000/generate`. Change the address in the plugin window
-or set `KICAD_AI_GENERATE_URL`. The service must return Graph IR v2 JSON with
-`nodes` and `edges`, an envelope containing that object in `graph`, `graph_ir`,
-or `result`, or `{"download_url": "/path/to/graph.json"}`. The downloaded file
-must be on the same origin as the upload endpoint. For example:
-
-```python
-from fastapi import FastAPI, UploadFile, File
-
-app = FastAPI()
-
-@app.post("/generate")
-async def generate(file: UploadFile = File(...)):
-    contents = await file.read()
-    # Send contents to the model and return its Graph IR v2 object.
-    return {"graph_schema": "ai-eda-graph-ir/v2.0", "nodes": [], "edges": []}
-```
+The action sends an unencrypted `.docx` file as multipart field `file` to
+`POST /api/v1/jobs`. Enter the **service root**, such as `http://127.0.0.1:8000`,
+in the plugin window or set `KICAD_AI_SERVICE_URL`. Optional `user_text`,
+`run_name`, and Bearer token (`AI_EDA_API_KEY`) are available in the window.
+The server returns a job ID; the plugin polls `status_url` until the job
+succeeds, then downloads raw Graph IR JSON from `result_url`. Failed or
+`needs_attention` jobs stop before drawing. The last status URL is saved in
+the plugin settings so **继续上次任务** can resume polling without submitting
+another upload. The previous `KICAD_AI_GENERATE_URL` environment variable
+is accepted as a compatibility alias for the service root.
 
 The plugin needs Python 3.10+, `protobuf`, `pynng`, and `PySide6-Essentials`
 from `plugins/requirements.txt`. It is launched by KiCad so
