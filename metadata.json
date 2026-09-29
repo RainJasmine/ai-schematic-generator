@@ -10,6 +10,6 @@
   "license": "GPL-3.0",
   "resources": {},
   "versions": [
-    {"version": "0.1.6", "status": "development", "kicad_version": "9.0", "runtime": "ipc"}
+    {"version": "0.1.7", "status": "development", "kicad_version": "9.0", "runtime": "ipc"}
   ]
 }
