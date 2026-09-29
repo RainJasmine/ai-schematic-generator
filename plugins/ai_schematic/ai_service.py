@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import tempfile
 import time
 from typing import Callable
 from urllib.error import HTTPError, URLError
@@ -177,3 +178,43 @@ def resume_job(url: str, status_url: str, *, token: str = "", wait_seconds: floa
     """Continue an existing server job without submitting the Word file again."""
     return _follow_job(_service_root(url), status_url, token=token,
                        wait_seconds=wait_seconds, on_progress=on_progress)
+
+
+def download_html_report(url: str, report_url: str, destination: str | Path,
+                         *, token: str = "") -> Path:
+    """Download a server-provided HTML report URL to a local file."""
+    target = _job_url(_service_root(url), report_url)
+    output = Path(destination)
+    if output.suffix.lower() not in {".html", ".htm"}:
+        raise AiServiceError("报告保存文件名必须以 .html 或 .htm 结尾")
+    headers = {"Accept": "text/html"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = Request(target, headers=headers)
+    opener = build_opener(ProxyHandler({}))
+    temporary: Path | None = None
+    try:
+        with opener.open(request, timeout=60) as response:
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type == "application/json":
+                raise AiServiceError("报告接口返回了 JSON，未获取到 HTML 文件")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=output.parent, suffix=".html.part", delete=False) as stream:
+                temporary = Path(stream.name)
+                while chunk := response.read(1024 * 1024):
+                    stream.write(chunk)
+        os.replace(temporary, output)
+    except HTTPError as exc:
+        detail = exc.read(2048).decode("utf-8", errors="replace")
+        try:
+            error = json.loads(detail).get("error", {})
+            detail = f"{error.get('code', '')}: {error.get('message', '')}".strip(": ") or detail
+        except (ValueError, AttributeError):
+            pass
+        raise AiServiceError(f"{target} 返回 HTTP {exc.code}：{detail}") from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise AiServiceError(f"无法下载 HTML 报告：{exc}") from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return output

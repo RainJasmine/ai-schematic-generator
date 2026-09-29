@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
-from ai_schematic.ai_service import AiServiceError, resume_job, upload_word
+from ai_schematic.ai_service import AiServiceError, download_html_report, resume_job, upload_word
 
 
 class FakeOpener:
@@ -22,6 +22,19 @@ class FakeOpener:
         if isinstance(reply, Exception):
             raise reply
         return BytesIO(json.dumps(reply).encode())
+
+
+class HtmlOpener:
+    def __init__(self, content: bytes, content_type: str = "text/html; charset=utf-8") -> None:
+        self.content = content
+        self.content_type = content_type
+        self.request = None
+
+    def open(self, request: object, timeout: int) -> BytesIO:
+        self.request = request
+        response = BytesIO(self.content)
+        response.headers = {"Content-Type": self.content_type}
+        return response
 
 
 class AiServiceTests(unittest.TestCase):
@@ -121,6 +134,39 @@ class AiServiceTests(unittest.TestCase):
         self.assertEqual([request.get_method() for request, _ in opener.requests],
                          ["GET", "GET", "GET"])
         sleep.assert_called_once_with(1)
+
+    def test_html_report_download_uses_token_and_writes_file(self) -> None:
+        opener = HtmlOpener(b"<!doctype html><html>report</html>")
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "report.html"
+            with patch("ai_schematic.ai_service.build_opener", return_value=opener):
+                result = download_html_report("http://127.0.0.1:8000",
+                                              "/api/v1/jobs/" + "a" * 32 + "/report",
+                                              destination, token="secret")
+            self.assertEqual(result, destination)
+            self.assertEqual(destination.read_bytes(), opener.content)
+            self.assertEqual(list(Path(directory).iterdir()), [destination])
+        self.assertEqual(opener.request.get_header("Authorization"), "Bearer secret")
+        self.assertEqual(opener.request.get_method(), "GET")
+
+    def test_html_report_rejects_foreign_url(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(AiServiceError, "同源"):
+                download_html_report("http://127.0.0.1:8000", "http://other.example/report",
+                                     Path(directory) / "report.html")
+
+    def test_html_report_http_error_preserves_existing_file(self) -> None:
+        report_url = "/api/v1/jobs/" + "a" * 32 + "/report"
+        error = HTTPError("http://127.0.0.1:8000" + report_url, 409, "Conflict", {},
+                          BytesIO(b'{"error":{"code":"REPORT_NOT_READY","message":"running"}}'))
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "report.html"
+            destination.write_bytes(b"previous report")
+            with patch("ai_schematic.ai_service.build_opener", return_value=FakeOpener(error)):
+                with self.assertRaisesRegex(AiServiceError, "REPORT_NOT_READY: running"):
+                    download_html_report("http://127.0.0.1:8000", report_url, destination)
+            self.assertEqual(destination.read_bytes(), b"previous report")
+            self.assertEqual(list(Path(directory).iterdir()), [destination])
 
 
 if __name__ == "__main__":

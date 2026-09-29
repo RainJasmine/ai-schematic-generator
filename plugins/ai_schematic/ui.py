@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from .generator import GenerationReport, generate
-from .ai_service import DEFAULT_URL, resume_job
+from .ai_service import DEFAULT_URL, download_html_report, resume_job
 from .graph_ir import GraphIR
 from .input_source import InputKind, load_graph_input
 
@@ -71,6 +71,28 @@ class GenerationWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class ReportDownloadWorker(QObject):
+    completed = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, service_url: str, report_url: str, destination: str,
+                 token: str) -> None:
+        super().__init__()
+        self._service_url = service_url
+        self._report_url = report_url
+        self._destination = destination
+        self._token = token
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            path = download_html_report(self._service_url, self._report_url,
+                                        self._destination, token=self._token)
+            self.completed.emit(str(path))
+        except Exception as exc:  # noqa: BLE001 - errors are presented in the UI
+            self.failed.emit(str(exc))
+
+
 class GeneratorWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -79,8 +101,11 @@ class GeneratorWindow(QMainWindow):
         self._input_kind: InputKind = "word"
         self._thread: QThread | None = None
         self._worker: GenerationWorker | None = None
+        self._report_thread: QThread | None = None
+        self._report_worker: ReportDownloadWorker | None = None
         self._settings = QSettings("SunvEDA", "AI Schematic Generator")
         self._job_id = ""
+        self._report_url = self._settings.value("report_url", "")
         self._last_sequence = 0
         self._last_progress_message = ""
         self._announced_success = False
@@ -143,11 +168,14 @@ class GeneratorWindow(QMainWindow):
         self.generate_button.setEnabled(False)
         self.resume_button = QPushButton("继续上次任务")
         self.resume_button.setEnabled(bool(self._settings.value("status_url", "")))
+        self.report_button = QPushButton("获取 HTML 报告")
+        self.report_button.setEnabled(bool(self._report_url))
         self.clear_button = QPushButton("清空日志")
         self.close_button = QPushButton("关闭")
         buttons.addStretch(1)
         buttons.addWidget(self.generate_button)
         buttons.addWidget(self.resume_button)
+        buttons.addWidget(self.report_button)
         buttons.addWidget(self.clear_button)
         buttons.addWidget(self.close_button)
         root.addLayout(buttons)
@@ -157,6 +185,7 @@ class GeneratorWindow(QMainWindow):
         self.json_button.clicked.connect(self.choose_json)
         self.generate_button.clicked.connect(self.start_generation)
         self.resume_button.clicked.connect(self.resume_generation)
+        self.report_button.clicked.connect(self.start_report_download)
         self.clear_button.clicked.connect(self.log.clear)
         self.close_button.clicked.connect(self.close)
 
@@ -241,6 +270,9 @@ class GeneratorWindow(QMainWindow):
     def on_job_state(self, job: dict) -> None:
         job_id = str(job.get("job_id", ""))
         if job_id and job_id != self._job_id:
+            if job_id != self._settings.value("job_id", ""):
+                self._report_url = ""
+                self._settings.remove("report_url")
             self._job_id = job_id
             self._settings.setValue("job_id", job_id)
             self._settings.setValue("status_url", job.get("status_url", ""))
@@ -248,6 +280,15 @@ class GeneratorWindow(QMainWindow):
             self._settings.sync()
             self.log.appendPlainText(f"任务 ID：{job_id}")
         status = str(job.get("status", ""))
+        if status in {"succeeded", "needs_attention", "failed"}:
+            report_url = job.get("report_url")
+            self._report_url = report_url if isinstance(report_url, str) else ""
+            if self._report_url:
+                self._settings.setValue("report_url", self._report_url)
+                self._settings.sync()
+                self.log.appendPlainText("HTML 设计报告已可下载")
+            else:
+                self._settings.remove("report_url")
         progress = job.get("progress") or {}
         if not isinstance(progress, dict):
             progress = {}
@@ -291,12 +332,64 @@ class GeneratorWindow(QMainWindow):
             self.log.appendPlainText("任务成功，正在下载 Graph IR…")
         elif status in {"failed", "needs_attention"}:
             self._settings.remove("status_url")
-            self._settings.remove("job_id")
+
+    @Slot()
+    def start_report_download(self) -> None:
+        if not self._report_url or self._report_thread is not None or self._thread is not None:
+            return
+        job_id = self._settings.value("job_id", "")
+        download_dir = Path.home() / "Downloads"
+        if not download_dir.is_dir():
+            download_dir = Path.home()
+        suggested = download_dir / f"ai-eda-report-{job_id or 'job'}.html"
+        destination, _ = QFileDialog.getSaveFileName(
+            self, "保存 HTML 设计报告", str(suggested), "HTML 文件 (*.html *.htm)")
+        if not destination:
+            return
+        if Path(destination).suffix.lower() not in {".html", ".htm"}:
+            destination += ".html"
+        self.log.appendPlainText(f"正在下载 HTML 报告：{destination}")
+        thread = QThread(self)
+        worker = ReportDownloadWorker(
+            self._settings.value("service_url", self.endpoint_edit.text().strip()),
+            self._report_url, destination, self.token_edit.text().strip())
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self.report_downloaded)
+        worker.failed.connect(self.report_download_failed)
+        worker.completed.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._report_worker_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._report_thread = thread
+        self._report_worker = worker
+        self._set_busy(False)
+        thread.start()
+
+    @Slot(str)
+    def report_downloaded(self, path: str) -> None:
+        self.log.appendPlainText(f"HTML 报告已保存：{path}")
+        try:
+            os.startfile(path)
+        except OSError as exc:
+            QMessageBox.warning(self, "打开报告失败", f"报告已下载到 {path}\n{exc}")
+
+    @Slot(str)
+    def report_download_failed(self, message: str) -> None:
+        self.log.appendPlainText(f"HTML 报告下载失败：{message}")
+        QMessageBox.warning(self, "报告下载失败", message)
+
+    @Slot()
+    def _report_worker_finished(self) -> None:
+        self._report_thread = None
+        self._report_worker = None
+        self._set_busy(self._thread is not None)
 
     @Slot(object)
     def generation_completed(self, report: GenerationReport) -> None:
         self._settings.remove("status_url")
-        self._settings.remove("job_id")
         self.log.appendPlainText("\n" + report.format())
         QMessageBox.information(self, "生成完成", report.format())
 
@@ -312,22 +405,24 @@ class GeneratorWindow(QMainWindow):
         self._set_busy(False)
 
     def _set_busy(self, busy: bool) -> None:
-        self.word_button.setEnabled(not busy)
-        self.json_button.setEnabled(not busy)
-        self.endpoint_edit.setEnabled(not busy and self._input_kind == "word")
-        self.token_edit.setEnabled(not busy)
-        self.user_text_edit.setEnabled(not busy and self._input_kind == "word")
-        self.run_name_edit.setEnabled(not busy and self._input_kind == "word")
-        self.generate_button.setEnabled(not busy and bool(self.path_edit.text()))
-        self.resume_button.setEnabled(not busy and bool(self._settings.value("status_url", "")))
-        self.close_button.setEnabled(not busy)
+        idle = not busy and self._report_thread is None
+        self.word_button.setEnabled(idle)
+        self.json_button.setEnabled(idle)
+        self.endpoint_edit.setEnabled(idle and self._input_kind == "word")
+        self.token_edit.setEnabled(idle)
+        self.user_text_edit.setEnabled(idle and self._input_kind == "word")
+        self.run_name_edit.setEnabled(idle and self._input_kind == "word")
+        self.generate_button.setEnabled(idle and bool(self.path_edit.text()))
+        self.resume_button.setEnabled(idle and bool(self._settings.value("status_url", "")))
+        self.report_button.setEnabled(idle and bool(self._report_url))
+        self.close_button.setEnabled(idle)
         self.progress.setRange(0, 0 if busy else 1)
         if not busy:
             self.progress.setValue(1)
 
     def closeEvent(self, event: object) -> None:  # noqa: N802 - Qt virtual name
-        if self._thread is not None:
-            QMessageBox.information(self, "正在生成", "请等待当前生成任务完成后再关闭窗口。")
+        if self._thread is not None or self._report_thread is not None:
+            QMessageBox.information(self, "正在处理", "请等待当前任务完成后再关闭窗口。")
             event.ignore()
             return
         event.accept()

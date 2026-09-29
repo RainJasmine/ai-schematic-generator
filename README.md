@@ -19,6 +19,14 @@ the plugin settings so **继续上次任务** can resume polling without submitt
 another upload. The previous `KICAD_AI_GENERATE_URL` environment variable
 is accepted as a compatibility alias for the service root.
 
+When a terminal job returns `report_url`, **获取 HTML 报告** downloads its HTML
+design report using the same Bearer token and opens the saved `.html` file
+with the Windows default app. Reports are available for successful, failed,
+and `needs_attention` jobs when the service provides one. The last report URL
+is saved in plugin settings, so it can be downloaded after reopening the
+window without uploading the Word file again. The report's own relative links
+to archived JSON or logs require separate downloads from the service.
+
 The plugin needs Python 3.10+, `protobuf`, `pynng`, and `PySide6-Essentials`
 from `plugins/requirements.txt`. It is launched by KiCad so
 `KICAD_API_SOCKET` and `KICAD_API_TOKEN` are provided by the editor. Its
