@@ -8,7 +8,9 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
-from ai_schematic.ai_service import AiServiceError, download_html_report, resume_job, upload_word
+from ai_schematic.ai_service import (AiServiceError, download_html_report, get_revision_state,
+                                     submit_revision, submit_text_job, wait_for_job,
+                                     resume_job, upload_word)
 
 
 class FakeOpener:
@@ -167,6 +169,40 @@ class AiServiceTests(unittest.TestCase):
                     download_html_report("http://127.0.0.1:8000", report_url, destination)
             self.assertEqual(destination.read_bytes(), b"previous report")
             self.assertEqual(list(Path(directory).iterdir()), [destination])
+
+    def test_text_submission_and_needs_attention_are_distinct_from_http_failure(self) -> None:
+        accepted = self._job("queued")
+        terminal = self._job("needs_attention", summary={"interaction_status": "awaiting_input"},
+                             report_url="/api/v1/jobs/" + "a" * 32 + "/report")
+        opener = FakeOpener(accepted, terminal)
+        with patch("ai_schematic.ai_service.build_opener", return_value=opener):
+            self.assertEqual(submit_text_job("设计接收链路", "http://127.0.0.1:8000",
+                                             token="secret", request_id="text-1"), accepted)
+            result = wait_for_job("http://127.0.0.1:8000", accepted["status_url"],
+                                  token="secret")
+        self.assertEqual(result, terminal)
+        self.assertEqual(opener.requests[0][0].get_method(), "POST")
+        self.assertIn(b'"request_id": "text-1"', opener.requests[0][0].data)
+        self.assertEqual(opener.requests[1][0].get_method(), "GET")
+        self.assertEqual([request.get_header("Authorization") for request, _ in opener.requests],
+                         ["Bearer secret", "Bearer secret"])
+
+    def test_revision_uses_server_baseline_and_contract_fields(self) -> None:
+        job_id = "a" * 32
+        opener = FakeOpener({"revision": 2, "graph_hash": "f" * 64,
+                             "head_job_id": job_id, "pending_job_id": None},
+                            self._job("queued"))
+        with patch("ai_schematic.ai_service.build_opener", return_value=opener):
+            baseline = get_revision_state("http://127.0.0.1:8000", job_id)
+            submit_revision("http://127.0.0.1:8000", job_id, "增加滤波器",
+                            baseline["revision"], baseline["graph_hash"],
+                            request_id="edit-1", selection={"node_ids": ["N1"], "edge_ids": []})
+        payload = json.loads(opener.requests[1][0].data)
+        self.assertEqual(payload["base_revision"], 2)
+        self.assertEqual(payload["base_graph_hash"], "f" * 64)
+        self.assertEqual(payload["selection"]["node_ids"], ["N1"])
+        self.assertFalse(payload["client_graph_dirty"])
+        self.assertNotIn("finish", payload)
 
 
 if __name__ == "__main__":

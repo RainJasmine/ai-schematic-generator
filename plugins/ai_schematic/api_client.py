@@ -140,6 +140,34 @@ class KiCadClient:
             request.items.add().Pack(item)
         return self.request(request, editor_commands_pb2.CreateItemsResponse)
 
+    def get_items_by_id(self, document: object, item_ids: list[str]) -> object:
+        request = editor_commands_pb2.GetItemsById()
+        request.header.document.CopyFrom(document)
+        for item_id in item_ids:
+            request.items.add().value = item_id
+        return self.request(request, editor_commands_pb2.GetItemsResponse)
+
+    def get_items(self, document: object) -> object:
+        request = editor_commands_pb2.GetItems()
+        request.header.document.CopyFrom(document)
+        return self.request(request, editor_commands_pb2.GetItemsResponse)
+
+    def delete_items(self, document: object, item_ids: list[str]) -> object:
+        request = editor_commands_pb2.DeleteItems()
+        request.header.document.CopyFrom(document)
+        for item_id in item_ids:
+            request.item_ids.add().value = item_id
+        return self.request(request, editor_commands_pb2.DeleteItemsResponse)
+
+    def get_selection(self, document: object) -> object:
+        request = editor_commands_pb2.GetSelection()
+        request.header.document.CopyFrom(document)
+        return self.request(request, editor_commands_pb2.SelectionResponse)
+
+    def document_snapshot(self, document: object) -> str:
+        response = self.get_items(document)
+        return "\n".join(sorted(item.SerializeToString().hex() for item in response.items))
+
     def end_commit(self, commit_id: str, commit: bool, message: str = "") -> None:
         request = editor_commands_pb2.EndCommit()
         request.id.value = commit_id

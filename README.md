@@ -1,55 +1,61 @@
-# AI Schematic Generator for KiCad
+# AI Schematic Generator for KiCad / SunvEDA
 
-This folder is the source of a KiCad PCM Python plugin. Package the **contents**
-of this directory as a ZIP with `metadata.json`, `plugins/`, and `resources/`
-at the archive root. Install that ZIP with KiCad's Plugin and Content Manager,
-then launch **Generate schematic from Word or JSON** from an open schematic editor.
+This repository contains a KiCad PCM Python plugin. Install the release ZIP in
+Plugin and Content Manager, open a schematic editor, then run **AI schematic
+design assistant**. The archive root contains `metadata.json`, `plugins/`, and
+`resources/`.
 
-Choose **选择 JSON…** to load a local Graph IR v2 JSON file and generate directly;
-this route makes no HTTP request. Choose **选择 Word…** to use the AI service.
+## Design workflow
 
-The action sends an unencrypted `.docx` file as multipart field `file` to
-`POST /api/v1/jobs`. Enter the **service root**, such as `http://127.0.0.1:8000`,
-in the plugin window or set `KICAD_AI_SERVICE_URL`. Optional `user_text`,
-`run_name`, and Bearer token (`AI_EDA_API_KEY`) are available in the window.
-The server returns a job ID; the plugin polls `status_url` until the job
-succeeds, then downloads raw Graph IR JSON from `result_url`. Failed or
-`needs_attention` jobs stop before drawing. The last status URL is saved in
-the plugin settings so **继续上次任务** can resume polling without submitting
-another upload. The previous `KICAD_AI_GENERATE_URL` environment variable
-is accepted as a compatibility alias for the service root.
+1. Enter the FastAPI service root, such as `http://127.0.0.1:8000`. Use
+   **检测连接** to read `/api/v1/capabilities`. An optional Bearer token can be
+   entered in the window or supplied as `AI_EDA_API_KEY`.
+2. Choose a `.docx` file, enter a pure text requirement, or import local
+   Graph IR v2 JSON. Word goes to `POST /api/v1/jobs`, text to
+   `POST /api/v1/jobs/text`. JSON import does not contact the server.
+3. The plugin polls the accepted job and downloads Graph IR only after
+   `succeeded`. It resolves local library symbols and draws the complete graph
+   in one KiCad Undo transaction. Missing symbols, invalid edges, and failed
+   wires stop publication. `needs_attention` and `failed` keep the current
+   successful graph in place.
+4. Enter feedback or a question to the current successful design. The plugin
+   checks the server's revision head and hash, verifies the schematic snapshot,
+   maps the current KiCad selection to Graph IR IDs, and posts a revision.
+   A successful revision replaces only the objects previously created by the
+   plugin. A question or request for clarification preserves the current graph
+   and can be continued in the next round.
 
-When a terminal job returns `report_url`, **获取 HTML 报告** downloads its HTML
-design report using the same Bearer token and opens the saved `.html` file
-with the Windows default app. Reports are available for successful, failed,
-and `needs_attention` jobs when the service provides one. The last report URL
-is saved in plugin settings, so it can be downloaded after reopening the
-window without uploading the Word file again. The report's own relative links
-to archived JSON or logs require separate downloads from the service.
+**新建设计** starts an independent first-round job. **版本记录** queries a locally
+saved job without changing the current schematic. **继续上次任务** resumes a job
+without reuploading its Word file. If an upload response is lost, the plugin
+keeps the request ID and asks you to locate the server job before resubmitting.
 
-The plugin needs Python 3.10+, `protobuf`, `pynng`, and `PySide6-Essentials`
-from `plugins/requirements.txt`. It is launched by KiCad so
-`KICAD_API_SOCKET` and `KICAD_API_TOKEN` are provided by the editor. Its
-protobuf Python bindings were generated from this checkout's `api/proto`.
+The **本轮 HTML 报告** and **当前图报告** buttons download the respective job's
+`report_url` using Bearer authentication, save the HTML file, and open it with
+the Windows default app. **当前需求** reads the successful job's requirements
+JSON. Report HTML does not include the linked archived JSON or log files.
 
-`nodes` are symbol instances, `edges` are the only electrical connections,
-and `paths` order symbol placement. An edge must be `connected` and map both
-ports to pin numbers in the chosen library symbol. Missing symbols and their
-incident edges are reported and skipped. Other symbols and edges are created
-in one KiCad Undo operation. The generator uses library pin geometry and graph
-edges to choose symbol rotations, then routes orthogonal wires around symbol
-bodies while penalizing crossings with already routed wires. Graph IR port
-`direction` describes signal flow, not a symbol's geometric rotation. Shared
-pins and dense or ambiguous connections can still require manual inspection.
+## Host and runtime requirements
 
-For Graph IR v2 binding output, `model_metadata.kicad_symbol_name` identifies
-the preferred library entry, while the stem of `kicad_library_path` is only a
-library nickname hint. The generator falls back to project-wide symbol search
-when the hint differs from the active project's library table. Each edge uses
-`source/target_node_id` and `source/target_port_id`; the corresponding node
-port's `pin_number` and optional `pin_name` select the physical library pin.
-Optional port `unit` and `body_style` select a matching symbol variant.
+The Python plugin requires Python 3.10+, `protobuf`, `pynng`, and
+`PySide6-Essentials` from `plugins/requirements.txt`. The editor supplies
+`KICAD_API_SOCKET` and `KICAD_API_TOKEN`. `KICAD_AI_SERVICE_URL` sets the
+service root; `KICAD_AI_GENERATE_URL` remains a compatibility alias.
 
-No KiCad C++ build changes are required. To regenerate the bindings after an
-API schema change, run `protoc -I api/proto --python_out=plugins/ai-schematic-generator/plugins/generated_proto`
-for the six `.proto` files presently in `plugins/generated_proto`.
+**Revision replacement requires the matching KiCad / SunvEDA host changes** in
+`C:\Users\Inori\source\repos\kicad`: schematic `GetItems`, `GetItemsById`,
+`GetSelection`, and `DeleteItems`, plus per-item deletion results. The Python
+protobuf schema is unchanged. A stock or older host without these handlers
+cannot verify a schematic snapshot and will refuse feedback or replacement.
+Rebuild and run the changed host before end-to-end testing.
+
+The plugin stores job IDs, URLs, revision metadata, and object fingerprints in
+`%LOCALAPPDATA%\SunvEDA\AI Schematic Generator\session.json`. Access tokens
+are not stored there. Feedback is blocked if the active sheet or any item has
+changed since the last plugin import; make a working copy and resolve local
+changes before continuing. The current implementation rebuilds the full
+plugin-managed graph on each successful revision, so object UUIDs, manually
+adjusted positions, and reference numbering may change.
+
+The service administration and symbol knowledge-base controls described in
+`二期插件修改方案.md` are separate work and are not included in this plugin release.

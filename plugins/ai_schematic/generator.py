@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import uuid
 from collections.abc import Callable
 
@@ -46,6 +47,12 @@ class GenerationReport:
     created_edges: list[str] = field(default_factory=list)
     skipped_edges: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    item_ids: list[str] = field(default_factory=list)
+    item_fingerprints: dict[str, str] = field(default_factory=dict)
+    document_token: str = ""
+    document_fingerprint: str = ""
+    node_item_ids: dict[str, str] = field(default_factory=dict)
+    edge_item_ids: dict[str, list[str]] = field(default_factory=dict)
 
     def format(self) -> str:
         lines = [
@@ -182,7 +189,60 @@ def _make_line(start: tuple[int, int], end: tuple[int, int]) -> object:
     return line
 
 
-def generate(graph: GraphIR, progress: Progress) -> GenerationReport:
+def _fingerprints(client: KiCadClient, document: object,
+                  item_ids: list[str]) -> dict[str, str]:
+    response = client.get_items_by_id(document, item_ids)
+    found: dict[str, str] = {}
+    for packed in response.items:
+        for item_type in (schematic_types_pb2.Symbol, schematic_types_pb2.Line):
+            item = item_type()
+            if packed.Unpack(item) and item.id.value:
+                found[item.id.value] = hashlib.sha256(packed.SerializeToString()).hexdigest()
+                break
+    if set(found) != set(item_ids):
+        raise ApiError("原理图中有插件创建的对象缺失，不能安全覆盖")
+    return found
+
+
+def verify_managed_placement(placement: dict) -> dict[str, list[str]]:
+    """Fail closed if the current schematic differs from the saved AI baseline."""
+    with KiCadClient() as client:
+        context = client.active_context()
+        if context.document.SerializeToString().hex() != placement.get("document_token"):
+            raise ApiError("当前图纸与已发布 AI 图纸不同")
+        expected_document = placement.get("document_fingerprint")
+        if not expected_document:
+            raise ApiError("没有完整图纸快照，不能确认本地修改状态")
+        actual_document = hashlib.sha256(
+            client.document_snapshot(context.document).encode("utf-8")
+        ).hexdigest()
+        if actual_document != expected_document:
+            raise ApiError("当前原理图已发生本地更改；请保存工作副本后处理")
+        ids = placement.get("item_ids") or []
+        if not ids or _fingerprints(client, context.document, ids) != placement.get("item_fingerprints"):
+            raise ApiError("插件生成的符号或导线已更改，不能提交反馈")
+        selected = client.get_selection(context.document)
+        node_by_item = {value: key for key, value in (placement.get("node_item_ids") or {}).items()}
+        edge_by_item = {item_id: edge_id
+                        for edge_id, item_ids in (placement.get("edge_item_ids") or {}).items()
+                        for item_id in item_ids}
+        nodes: set[str] = set()
+        edges: set[str] = set()
+        for packed in selected.items:
+            for item_type in (schematic_types_pb2.Symbol, schematic_types_pb2.Line):
+                item = item_type()
+                if packed.Unpack(item):
+                    if item.id.value in node_by_item:
+                        nodes.add(node_by_item[item.id.value])
+                    if item.id.value in edge_by_item:
+                        edges.add(edge_by_item[item.id.value])
+                    break
+        return {"node_ids": sorted(nodes)[:50], "edge_ids": sorted(edges)[:50]}
+
+
+def generate(graph: GraphIR, progress: Progress,
+             replace: dict | None = None, *,
+             require_complete: bool = False) -> GenerationReport:
     report = GenerationReport(
         graph_id=graph.graph_id,
         warnings=[*(f"解析错误：{value}" for value in graph.errors), *graph.warnings],
@@ -194,6 +254,21 @@ def generate(graph: GraphIR, progress: Progress) -> GenerationReport:
     with KiCadClient() as client:
         progress("读取当前活动原理图和画布信息…")
         context = client.active_context()
+        strict = replace is not None or require_complete
+        report.document_token = context.document.SerializeToString().hex()
+        if replace is not None:
+            if replace.get("document_token") != report.document_token:
+                raise ApiError("当前原理图与上次生成的图纸不同，不能覆盖旧图")
+            old_ids = replace.get("item_ids") or []
+            old_fingerprints = replace.get("item_fingerprints") or {}
+            if not old_ids or not old_fingerprints:
+                raise ApiError("旧图缺少对象校验记录，不能安全提交反馈图")
+            if _fingerprints(client, context.document, old_ids) != old_fingerprints:
+                raise ApiError("插件创建的原理图对象已被修改，请先保存工作副本")
+            if hashlib.sha256(client.document_snapshot(context.document).encode("utf-8")).hexdigest() != replace.get("document_fingerprint"):
+                raise ApiError("本地图纸在反馈任务运行期间发生修改，旧图已保留")
+        if strict and (graph.errors or len(graph.connections) != len(graph.edges)):
+            raise ApiError("Graph IR 存在无效连接，原理图未修改")
         resolved: dict[str, ResolvedSymbol] = {}
 
         for index, node in enumerate(graph.nodes, start=1):
@@ -217,8 +292,12 @@ def generate(graph: GraphIR, progress: Progress) -> GenerationReport:
             )
 
         if not resolved:
+            if strict:
+                raise ApiError("没有找到可创建的符号，原理图未修改")
             progress("没有找到任何可创建的符号，未修改原理图")
             return report
+        if strict and len(resolved) != len(graph.nodes):
+            raise ApiError("图中有符号未能匹配，原理图未修改")
 
         pin_uses: dict[tuple[str, str], set[str]] = {}
         for edge in graph.connections:
@@ -289,6 +368,8 @@ def generate(graph: GraphIR, progress: Progress) -> GenerationReport:
                     continue
                 created_symbols[node.node_id] = created
                 report.created_nodes.append(node.node_id)
+                report.item_ids.append(created.id.value)
+                report.node_item_ids[node.node_id] = created.id.value
 
             if len(create_response.created_items) != len(requested_symbols):
                 raise ApiError("KiCad 返回的符号创建结果数量不匹配")
@@ -343,9 +424,17 @@ def generate(graph: GraphIR, progress: Progress) -> GenerationReport:
                     line_response = client.create_items(context.document, requested_lines)
                     if len(line_response.created_items) != len(requested_lines):
                         raise ApiError("KiCad 返回的导线创建结果数量不匹配")
-                    for edge_id, result in zip(line_edges, line_response.created_items):
+                    for edge_id, requested, result in zip(line_edges, requested_lines,
+                                                          line_response.created_items):
                         if result.status.code == editor_commands_pb2.ISC_OK:
                             successful_edges.add(edge_id)
+                            created = schematic_types_pb2.Line()
+                            if result.item.Unpack(created) and created.id.value:
+                                item_id = created.id.value
+                            else:
+                                item_id = requested.id.value
+                            report.item_ids.append(item_id)
+                            report.edge_item_ids.setdefault(edge_id, []).append(item_id)
                         else:
                             failed_edges.add(edge_id)
                             report.skipped_edges[edge_id] = (
@@ -358,12 +447,28 @@ def generate(graph: GraphIR, progress: Progress) -> GenerationReport:
                                    ", ".join(sorted(failed_edges)))
 
                 report.created_edges.extend(sorted(successful_edges - failed_edges))
+            if strict and (report.skipped_nodes or report.skipped_edges):
+                raise ApiError("图未能完整绘制，已取消本次生成")
+            if replace is not None:
+                deletion = client.delete_items(context.document, old_ids)
+                if (len(deletion.deleted_items) != len(old_ids)
+                        or any(row.status != editor_commands_pb2.IDS_OK
+                               for row in deletion.deleted_items)):
+                    raise ApiError("旧图对象删除未全部成功，已取消本次更新")
             client.end_commit(
                 commit_id,
                 commit=True,
                 message=f"Generate schematic from AI graph {graph.graph_id}",
             )
             committed = True
+            try:
+                report.item_fingerprints = _fingerprints(client, context.document,
+                                                         report.item_ids)
+                report.document_fingerprint = hashlib.sha256(
+                    client.document_snapshot(context.document).encode("utf-8")
+                ).hexdigest()
+            except ApiError as exc:
+                report.warnings.append(f"无法记录对象校验信息，后续反馈暂不可用：{exc}")
         finally:
             if not committed:
                 try:
