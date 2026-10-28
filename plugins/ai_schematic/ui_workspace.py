@@ -43,7 +43,7 @@ def build_workspace(w):
     top_row.setContentsMargins(0, 0, 0, 12)
     w.breadcrumb = label("RF EDA · AI 设计助手", "sectionTitle")
     top_row.addWidget(w.breadcrumb, 1)
-    top_row.addWidget(label("0.2.6", wrap=False))
+    top_row.addWidget(label("0.2.8", wrap=False))
     top_row.addWidget(w.button("manage", "设置", w.open_management))
     outer.addWidget(top)
     w.tabs = QTabWidget()

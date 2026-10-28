@@ -1,6 +1,6 @@
 # RF EDA · AI 原理图设计助手
 
-版本 **0.2.6**。面向 KiCad 的紧凑型 AI 设计辅助窗口，支持技术协议上传、文字需求、连续设计反馈、指标与报告查看，以及一键更新原理图。
+版本 **0.2.8**。面向 KiCad 的紧凑型 AI 设计辅助窗口，支持技术协议上传、文字需求、连续设计反馈、指标与报告查看，以及一键更新原理图。
 
 ## 从需求到原理图
 
@@ -35,7 +35,7 @@
 python tools/package_plugin.py
 ```
 
-生成 `dist/rf-eda-ai-schematic-0.2.6.zip`，通过 KiCad PCM 安装。插件标识为 `org.rfeda.ai-schematic-generator`。升级后关闭旧插件窗口，再重新打开；源码修改需重新打包安装。依赖由 KiCad 插件环境安装，亦可在对应 Python 环境执行：
+生成 `dist/rf-eda-ai-schematic-0.2.8.zip`，通过 KiCad PCM 安装。插件标识为 `org.rfeda.ai-schematic-generator`。升级后关闭旧插件窗口，再重新打开；源码修改需重新打包安装。依赖由 KiCad 插件环境安装，亦可在对应 Python 环境执行：
 
 ```powershell
 python -m pip install -r plugins/requirements.txt
@@ -68,6 +68,8 @@ AI 服务通过 `/api/v1/capabilities` 声明能力，当前反馈要求 `revisi
 
 开发维护约定、消息字段及已有 `.proto` 见 [手动更新与清空图页接口](docs/手动更新与清空图页接口.md)。坐标适配为 Eeschema **10,000 IU/mm**，识别 `schematic_internal_unit`；宿主的上下文、库几何和创建响应需使用同一约定。
 
+符号库明确定义在同一坐标的同名接地脚，按一个物理接点核对，同时保留各引脚编号。信号脚、跨器件连接及独立网络继续逐项核对。
+
 ## 会话与记录
 
 | 操作 | 清理范围 |
@@ -80,6 +82,8 @@ AI 服务通过 `/api/v1/capabilities` 声明能力，当前反馈要求 `revisi
 会话自动保存在 `%LOCALAPPDATA%/RFEDA/AI Schematic Generator/sessions`，按服务和工作区隔离。网络重试保留原请求及 ID；停止等待或关闭窗口后，服务端任务继续，可恢复查询。
 
 更新操作保留本地操作日志。若提交响应未确认，先在 KiCad 检查并处理上次操作，再使用“处理未确认操作”恢复更新入口。配置保存/应用、模型测试和符号库发布保留各自确认与结果状态。
+
+反馈诊断缓存兼容符号库同步批次标识，支持恢复查看与继续反馈；原有服务凭据隔离及会话原子保存保持有效。
 
 ## 文件用途
 

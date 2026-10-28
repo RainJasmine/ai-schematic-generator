@@ -164,6 +164,22 @@ class FakeClient:
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_budget_diagnostic_with_library_generation_survives_recovery(self):
+        self.seed_success()
+        self.client.jobs[NEW_ID] = job(NEW_ID, "needs_attention")
+        self.client.diagnostic = {"interaction_status": "budget_exhausted", "message": "候选待复核",
+            "trace": [{"result": {"diff": {"node_changes": [{"after": {"ports": [
+                {"kicad_sync_token": "797449f78a79bc84-7408c0bf51dc"}]} }]}}}]}
+        self.workflow.save(operation={"kind": "revision", "parent_job_id": OLD_ID, "job": job(NEW_ID, "running")})
+        result = self.workflow.resume()
+        self.assertEqual(result["diagnostic"], self.client.diagnostic)
+        self.assertEqual(NEW_ID, self.workflow.state["continuation_job_id"])
+        self.assertEqual(OLD_ID, self.workflow.state["success"]["job"]["job_id"])
+        loaded = ClientWorkflow(self.client, SessionStore(self.store.directory), project_id="sheet-A", canvas=self.canvas)
+        self.assertEqual(self.client.diagnostic, loaded.state["operation"]["diagnostic"])
+        self.assertEqual([], self.client.posts)
+        self.assertEqual(0, self.canvas.mutations)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

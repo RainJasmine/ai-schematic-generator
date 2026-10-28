@@ -162,6 +162,26 @@ class FakeClient:
 
 
 class GeneratorTests(unittest.TestCase):
+    def test_manual_update_accepts_library_stacked_unused_grounds_without_readback(self):
+        original = self.client.symbol_definition
+        def definition(library_id):
+            value = original(library_id)
+            for number in ("4", "5"):
+                pin = value.variants[0].pins.add(number=number, name="GND", unit=1, body_style=1)
+                pin.position.x_nm, pin.position.y_nm = -20000, -60000
+            return value
+        raw = graph().source
+        for node in raw["nodes"]:
+            node["ports"].extend({"port_id": "GND_" + number, "pin_number": number, "pin_name": "GND",
+                "port_role": "ground", "domain": "POWER", "unit": 1, "body_style": 1} for number in ("4", "5"))
+        with patch.object(self.client, "symbol_definition", side_effect=definition), \
+             patch.object(self.client, "get_items", side_effect=AssertionError("No canvas readback")):
+            report = generate(GraphIR.parse(raw), lambda _: None, target=capture_target(readback=False), replace_all=True)
+        self.assertEqual(report.created_edges, ["E"])
+        self.assertTrue(report.page_replaced)
+        self.assertFalse(report.readback_verified)
+        self.assertEqual(self.client.ends, [True])
+
     def setUp(self):
         self.client = FakeClient()
         self.patch = patch("ai_schematic.generator.KiCadClient", return_value=self.client)

@@ -71,7 +71,11 @@ def _assert_secret_free(value: object) -> None:
     if isinstance(value, dict):
         for key, child in value.items():
             normalized = str(key).casefold().replace("-", "_")
-            if normalized != "document_token" and (normalized in _FORBIDDEN or normalized.endswith(("_api_key", "_password", "_secret", "_token"))):
+            # 知识库同步批次是“源摘要16位-随机12位”，用于识别库数据代际，不是认证令牌。
+            # 精确校验这一项，不能为所有 *_token 字段放行。
+            library_identity = normalized == "kicad_sync_token" and (
+                child is None or isinstance(child, str) and (child == "" or re.fullmatch(r"[0-9a-f]{16}-[0-9a-f]{12}", child) is not None))
+            if normalized != "document_token" and not library_identity and (normalized in _FORBIDDEN or normalized.endswith(("_api_key", "_password", "_secret", "_token"))):
                 raise ValueError("会话缓存禁止保存凭据、令牌或敏感管理表单")
             _assert_secret_free(child)
     elif isinstance(value, list):

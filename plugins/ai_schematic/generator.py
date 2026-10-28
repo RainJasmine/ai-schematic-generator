@@ -545,7 +545,10 @@ def _overlap(a, b):
     return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
 
 
-def _edge_nets(graph: GraphIR) -> dict[str, str]:
+def _edge_nets(graph: GraphIR, pin_nets: dict | None = None) -> dict[str, str]:
+    if pin_nets is not None:
+        return {edge.edge_id: repr(pin_nets[(edge.source_node_id, edge.source_port_id)])
+                for edge in graph.connections}
     parent = {}
     def endpoint(node_id, port_id):
         port = graph.node_map[node_id].port(port_id)
@@ -838,7 +841,9 @@ def generate(graph: GraphIR, progress: Progress, replace: dict | None = None, *,
                     forbidden_points.extend((int(pin.position.x_nm), int(pin.position.y_nm)) for pin in item.pins)
                 elif isinstance(item, schematic_types_pb2.Junction):
                     forbidden_points.append((int(item.position.x_nm), int(item.position.y_nm)))
-            nets = _edge_nets(graph)
+            definitions = {node: value.definition for node, value in resolved.items()}
+            pin_nets = snapshots.expected_pin_nets(graph, node_symbols, library_definitions=definitions)
+            nets = _edge_nets(graph, pin_nets)
             net_pins = {}
             for edge in graph.connections:
                 for node, port in ((edge.source_node_id, edge.source_port_id),
@@ -846,6 +851,12 @@ def generate(graph: GraphIR, progress: Progress, replace: dict | None = None, *,
                     physical = snapshots.physical_pin(node_symbols[node], graph.node_map[node].port(port))
                     if physical is not None:
                         net_pins.setdefault(nets[edge.edge_id], set()).add(snapshots.pin_token(*physical))
+            # 重叠接地脚属于同一已验证的物理接点，布线和最终校验使用同一网络分区。
+            for net in set(nets.values()):
+                for (node, port), root in pin_nets.items():
+                    if repr(root) == net:
+                        physical = snapshots.physical_pin(node_symbols[node], graph.node_map[node].port(port))
+                        net_pins.setdefault(net, set()).add(snapshots.pin_token(*physical))
             for edge in graph.connections:
                 source = snapshots.physical_pin(node_symbols[edge.source_node_id], graph.node_map[edge.source_node_id].port(edge.source_port_id))
                 dest = snapshots.physical_pin(node_symbols[edge.target_node_id], graph.node_map[edge.target_node_id].port(edge.target_port_id))
@@ -900,7 +911,7 @@ def generate(graph: GraphIR, progress: Progress, replace: dict | None = None, *,
                 raise ApiError("回读图纸发现符号重叠，取消本次导入。", code="KICAD_LAYOUT_COLLISION")
             reread_symbols = {node: [actual_map[item] for item in ids if item in actual_map]
                               for node, ids in report.node_items.items()}
-            snapshots.validate_graph_connections(graph, reread_symbols, actual)
+            snapshots.validate_graph_connections(graph, reread_symbols, actual, library_definitions=definitions)
             new_owned = _owned_ids(report.to_dict())
             snapshots.require_isolated_ownership(actual, new_owned)
             # 无回读模式只验证创建响应中的几何连接，不把响应伪装成图纸快照。

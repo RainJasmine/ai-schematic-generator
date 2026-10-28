@@ -238,10 +238,12 @@ def physical_pin(symbols: list[Message], port) -> tuple[Message, Message] | None
     return None
 
 
-def validate_graph_connections(graph, node_symbols: dict[str, list[Message]], all_items: list[Message]) -> None:
-    """Compare Graph IR port-net partition against actual returned geometry."""
-    points, components = net_components(all_items)
-    ports = {}
+def expected_pin_nets(graph, node_symbols: dict[str, list[Message]], *, library_definitions=None) -> dict:
+    """Graph IR 网络加上已由库定义证实的重叠接地脚身份。
+
+    仅接纳同一符号实例、同名 ground 端口、库内同坐标且响应也同坐标的脚。
+    不能用 GND 名称跨器件合并，也不能把图中两个明确独立的网络并在一起。
+    """
     parent = {}
 
     def find(key):
@@ -255,7 +257,7 @@ def validate_graph_connections(graph, node_symbols: dict[str, list[Message]], al
         if a != b:
             parent[max(a, b)] = min(a, b)
 
-    identities = {}
+    identities, physical_ports = {}, {}
     for node in graph.nodes:
         for port in node.ports:
             if not port.pin_number:
@@ -266,20 +268,74 @@ def validate_graph_connections(graph, node_symbols: dict[str, list[Message]], al
             symbol, pin = physical
             key = (node.node_id, port.port_id)
             token = pin_token(symbol, pin)
-            ports[key] = components[points[token]]
+            physical_ports[key] = physical
             find(key)
             if token in identities:
                 union(key, identities[token])
             identities[token] = key
+    connected = set()
     for edge in graph.connections:
         source = (edge.source_node_id, edge.source_port_id)
         target = (edge.target_node_id, edge.target_port_id)
-        if source not in ports or target not in ports:
+        if source not in physical_ports or target not in physical_ports:
             raise ValueError(f"{edge.edge_id} 缺少实际引脚")
         union(source, target)
+        connected.update((source, target))
+    for node in graph.nodes:
+        definition = (library_definitions or {}).get(node.node_id)
+        if definition is None:
+            continue
+        for symbol in node_symbols[node.node_id]:
+            pins = [pin for variant in definition.variants
+                    if variant.unit in (0, symbol.unit) and variant.body_style in (0, symbol.body_style)
+                    for pin in variant.pins]
+            groups = {}
+            for port in node.ports:
+                key = (node.node_id, port.port_id)
+                if (key not in physical_ports or port.port_role.casefold() != "ground"
+                        or port.domain.upper() not in {"POWER", "DC"}):
+                    continue
+                actual_symbol, actual_pin = physical_ports[key]
+                if actual_symbol.id.value != symbol.id.value:
+                    continue
+                matches = [pin for pin in pins if pin_matches(port, pin)]
+                if len(matches) != 1:
+                    continue
+                pin = matches[0]
+                name = pin.name.strip().casefold()
+                if name not in {"gnd", "ground", "agnd", "dgnd"}:
+                    continue
+                group = (int(pin.position.x_nm), int(pin.position.y_nm), name)
+                groups.setdefault(group, []).append(key)
+            for keys in groups.values():
+                if len({pin_token(*physical_ports[key]) for key in keys}) < 2:
+                    continue
+                positions = {(int(physical_ports[key][1].position.x_nm), int(physical_ports[key][1].position.y_nm)) for key in keys}
+                if len(positions) != 1:
+                    raise ValueError(f"{node.node_id} 的重叠接地脚位置与符号库定义不一致")
+                if len({find(key) for key in keys if key in connected}) > 1:
+                    raise ValueError(f"{node.node_id} 的重叠接地脚被分配到不同网络，请检查连接")
+                for key in keys[1:]:
+                    union(keys[0], key)
+    return {key: find(key) for key in physical_ports}
+
+
+def validate_graph_connections(graph, node_symbols: dict[str, list[Message]], all_items: list[Message], *, library_definitions=None) -> None:
+    """Compare intended physical nets against creation responses or legacy readback."""
+    points, components = net_components(all_items)
+    expected_nets = expected_pin_nets(graph, node_symbols, library_definitions=library_definitions)
+    ports, identities = {}, {}
+    for node in graph.nodes:
+        for port in node.ports:
+            if not port.pin_number:
+                continue
+            symbol, pin = physical_pin(node_symbols[node.node_id], port)
+            token = pin_token(symbol, pin)
+            ports[(node.node_id, port.port_id)] = components[points[token]]
+            identities[token] = (node.node_id, port.port_id)
     expected_to_actual, actual_to_expected = {}, {}
     for port, actual in ports.items():
-        expected = find(port)
+        expected = expected_nets[port]
         if expected in expected_to_actual and expected_to_actual[expected] != actual:
             raise ValueError(f"Graph IR连接未形成完整网络：{port[0]}/{port[1]}")
         if actual in actual_to_expected and actual_to_expected[actual] != expected:

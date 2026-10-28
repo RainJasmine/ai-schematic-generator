@@ -13,6 +13,21 @@ from ai_schematic.session_store import SessionConflict, SessionStore, read_legac
 
 
 class SessionStoreTests(unittest.TestCase):
+    def test_library_sync_generation_is_not_an_access_credential(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(directory)
+            state = {"operation": {"diagnostic": {"trace": [{"result": {"diff": {"node_changes": [
+                {"after": {"ports": [{"kicad_sync_token": "797449f78a79bc84-7408c0bf51dc"}]}}
+            ]}}}]}}}
+            store.save("http://localhost:8000", "project", state)
+            self.assertEqual(state, store.load("http://localhost:8000", "project"))
+            for key, value in (("kicad_sync_token", "Bearer sensitive"),
+                               ("kicad_sync_token", {"token": "secret"}),
+                               ("custom_token", "797449f78a79bc84-7408c0bf51dc"),
+                               ("access_token", "797449f78a79bc84-7408c0bf51dc")):
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    store.save("http://localhost:8000", "project", {"nested": {key: value}})
+
     def test_namespace_isolated_by_service_and_project(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SessionStore(directory)
