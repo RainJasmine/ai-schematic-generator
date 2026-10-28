@@ -157,11 +157,11 @@ class GeneratorWindow(QMainWindow):
             self.progress.setValue(1)
             self.progress.setFormat("已完整导入")
             self.status.setText("原理图已更新")
-            self.append_conversation("assistant", "原理图已更新。后续生成的结果仍需点击更新按钮应用。")
+            self.append_conversation("assistant", "原理图已更新，可继续查看设计结果或提交反馈。")
         elif isinstance(task.value, dict) and task.value.get("ready"):
             self.status.setText("设计结果已生成；点击“更新原理图”应用")
-            self.progress.setFormat("结果已生成，尚未应用")
-            self.append_conversation("assistant", "设计结果已生成。可查看设计指标要求、报告或继续反馈；点击“更新原理图”后才会写入画布。")
+            self.progress.setFormat("结果已生成")
+            self.append_conversation("assistant", "设计结果已生成，可查看指标和报告，或继续完善设计。")
         elif isinstance(task.value, dict) and task.value.get("adopted"):
             self.status.setText("旧版图已完成只读核验和会话恢复；未重新运行 AI、未重画图")
             head = task.value.get("head_job_id")
@@ -203,7 +203,7 @@ class GeneratorWindow(QMainWindow):
         feedback_ready = bool(success and idle and not state.get("new_design") and not mismatch)
         feedback = self.feedback.toPlainText().strip()
         self.buttons["feedback"].setEnabled(feedback_ready and not state.get("ended") and 0 < len(feedback) <= 12000)
-        self.buttons["feedback"].setToolTip("仅依据后端设计版本，不读取或上传画布中的人工修改")
+        self.buttons["feedback"].setToolTip("提交修改要求或设计问题")
         for key in ("new_feedback", "composer_new_feedback"):
             self.buttons[key].setEnabled(feedback_ready)
         self.buttons["finish"].setEnabled(bool((success or state.get("local_graph")) and idle))
@@ -214,8 +214,8 @@ class GeneratorWindow(QMainWindow):
         has_graph = bool(success.get("graph") or state.get("local_graph"))
         self.buttons["apply"].setText("更新原理图" if has_graph else "清空当前图页")
         self.buttons["apply"].setToolTip(
-            "清空当前图页并按已有设计结果重绘" if has_graph else
-            "当前没有待应用的设计图；点击后仅清空当前活动图页")
+            "将当前设计结果应用到当前原理图页" if has_graph else
+            "清空当前原理图页的全部内容，操作前需确认")
         self.buttons["apply"].setEnabled(bool(idle and not state.get("uncertain")))
         self.buttons["remove_file"].setEnabled(bool(self.path.text()))
         self.buttons["clear_records"].setEnabled(idle and not state.get("uncertain"))
@@ -241,7 +241,7 @@ class GeneratorWindow(QMainWindow):
             self.target_label.setText("上次绘图结果待确认；AI 反馈仍可继续，禁止重复写图")
         if restore_draft:
             self.choices.clear()
-            self.selection_label.setText("反馈只依据后端版本；人工改图不参与，下次更新将清空旧图。")
+            self.selection_label.setText("描述修改目标，或咨询当前设计。")
             for widget, key in ((self.user_text, "user_text"), (self.feedback, "feedback")):
                 widget.blockSignals(True)
                 widget.setPlainText((state.get("draft") or {}).get(key, ""))
@@ -276,7 +276,7 @@ class GeneratorWindow(QMainWindow):
         if event.get("type") == "mutation":
             self.mutating = True
             self.buttons["stop"].setEnabled(False)
-            self.status.setText("正在事务内清空并更新图页，请等待完成")
+            self.status.setText("正在处理当前原理图页，请稍候…")
             return
         job = event.get("job") or {}
         p = job.get("progress") or {}
@@ -320,7 +320,7 @@ class GeneratorWindow(QMainWindow):
     def import_local_graph(self):
         if not self.switch_service():
             return
-        path, _ = QFileDialog.getOpenFileName(self, "导入本地 Graph IR（不调用 AI）", str(Path.home()), "Graph IR (*.json)")
+        path, _ = QFileDialog.getOpenFileName(self, "导入本地 Graph IR", str(Path.home()), "Graph IR (*.json)")
         if path:
             self.launch(lambda task: self.workflow.create("json", path=path, stop_event=task.stop_event),
                         "正在解析并缓存本地 Graph IR…")
@@ -358,7 +358,7 @@ class GeneratorWindow(QMainWindow):
         self.choices.setVisible(feedback and self.choices.count() > 0)
         self.selection_label.setVisible(feedback)
         self.feedback_toolbar.setVisible(feedback)
-        self.input_hint.setText("基于当前成功图修改或咨询" if feedback else "仅 Word / Word＋文字 / 仅文字")
+        self.input_hint.setText("修改设计 / 咨询方案" if feedback else "仅 Word / Word＋文字 / 仅文字")
         text = self.feedback.toPlainText() if feedback else self.user_text.toPlainText()
         self.char_count.setText(f"{len(text)} / {12000 if feedback else 20000}")
 
@@ -377,19 +377,19 @@ class GeneratorWindow(QMainWindow):
         version = f"v{revision}" if revision else ("已生成" if success else "未生成")
         applied = state.get("applied_revision")
         canvas = f"画布 v{applied}" if applied else ("画布有旧绘图记录" if state.get("import") else "画布未更新")
-        self.version_label.setText("后端 " + version + " · " + canvas + (" · 已结束" if state.get("ended") else ""))
+        self.version_label.setText("设计 " + version + " · " + canvas + (" · 已结束" if state.get("ended") else ""))
         self.design_heading.setText("继续设计" if success and not state.get("new_design") else "开始设计")
         kind = "Word＋文字" if self.path.text() and self.user_text.toPlainText().strip() else ("Word 技术协议" if self.path.text() else "文字需求")
         self.input_summary.setText("输入方式：" + kind)
         self.service_summary.setText("AI 服务\n" + (self.credential_origin or self.endpoint.text()).removeprefix("http://").removeprefix("https://"))
-        self.task_summary.setText("后端版本：" + version + "\n本轮任务：" + str(job.get("job_id") or "尚未提交") + "\n" + self.status.text())
+        self.task_summary.setText("设计版本：" + version + "\n本轮任务：" + str(job.get("job_id") or "尚未提交") + "\n" + self.status.text())
         if state.get("uncertain"):
             self.stage_detail.setText("图纸事务待核验")
         elif success and job.get("job_id") == success.get("job", {}).get("job_id") and job.get("status") == "succeeded":
-            self.stage_detail.setText("设计结果已生成，画布仅在点击更新时重绘")
+            self.stage_detail.setText("设计结果已就绪，可查看报告或更新原理图")
         else:
             progress = job.get("progress") or {}
-            self.stage_detail.setText(str(progress.get("stage_label") or job.get("stage") or job.get("status") or "尚未开始；以服务实际事件为准"))
+            self.stage_detail.setText(str(progress.get("stage_label") or job.get("stage") or job.get("status") or "等待开始设计"))
         self.composer_changed()
 
     def resizeEvent(self, event):
@@ -412,7 +412,7 @@ class GeneratorWindow(QMainWindow):
             return
         text = self.feedback.toPlainText()
         self.append_conversation("user", text)
-        self.launch(lambda task: self.workflow.revise(text, stop_event=task.stop_event), "正在基于后端设计版本提交反馈…")
+        self.launch(lambda task: self.workflow.revise(text, stop_event=task.stop_event), "正在提交设计反馈…")
 
     def resume_by_id(self):
         if not self.switch_service():
@@ -420,7 +420,7 @@ class GeneratorWindow(QMainWindow):
         if self.workflow.state.get("pending"):
             QMessageBox.information(self, "原请求尚未确认", "请先继续原冻结请求，不能用其他任务替代")
             return
-        identifier, accepted = QInputDialog.getText(self, "按任务 ID 恢复", "成功结果仅查询并缓存，仍需点击更新原理图；历史版本只读预览。输入本服务的 32 位任务 ID：")
+        identifier, accepted = QInputDialog.getText(self, "按任务 ID 恢复", "输入本服务的 32 位任务 ID：")
         if accepted and identifier.strip():
             self.launch(lambda task: self.workflow.resume(identifier.strip(), stop_event=task.stop_event), "正在核验并恢复指定任务…")
 
@@ -467,7 +467,7 @@ class GeneratorWindow(QMainWindow):
         if not self.switch_service():
             return
         if self.workflow.state.get("success") or self.workflow.state.get("import") or self.workflow.state.get("operation"):
-            answer = QMessageBox.question(self, "新建设计", "开始新设计将清空当前对话和输入；历史任务仍可在版本记录查看。不会自动更新或清空原理图。继续吗？")
+            answer = QMessageBox.question(self, "新建设计", "开始新设计将清空当前对话和输入，历史任务保留在版本记录中。是否继续？")
             if answer != QMessageBox.StandardButton.Yes:
                 return
         self.workflow.arm_new_design()
@@ -476,7 +476,7 @@ class GeneratorWindow(QMainWindow):
             widget.blockSignals(True)
             widget.clear()
             widget.blockSignals(False)
-        self.status.setText("已准备新设计；生成结果不会自动写入画布")
+        self.status.setText("已准备新设计，请上传技术协议或描述设计目标")
         self.render()
 
     def test_connection(self):
@@ -487,7 +487,7 @@ class GeneratorWindow(QMainWindow):
                 raise ValueError("服务协议不兼容，需要 API 1.x 与 Graph IR v2")
             return caps
         self.launch(work, "正在检测服务和协议能力…", lambda caps: self.status.setText(
-            f"服务可访问 · API {caps.get('api_version')} · {caps.get('execution_mode')}；模型和数据库需要单独测试"))
+            f"服务连接正常 · API {caps.get('api_version')} · {caps.get('execution_mode')}"))
 
     def download_report(self, current):
         if not self.switch_service():
@@ -523,7 +523,7 @@ class GeneratorWindow(QMainWindow):
             QMessageBox.information(self, "版本记录", "当前服务、图纸没有本地任务记录；可使用任务 ID 恢复查询")
             return
         labels = [f"{row['job_id']} · {row.get('status', 'succeeded')} · {row.get('run_name') or ''}" for row in reversed(list(rows.values()))]
-        label, accepted = QInputDialog.getItem(self, "版本记录", "仅查询预览，不改变当前图或恢复目标", labels, 0, False)
+        label, accepted = QInputDialog.getItem(self, "版本记录", "选择要查看的设计版本", labels, 0, False)
         if not accepted:
             return
         identifier = label.split(" · ", 1)[0]
@@ -557,11 +557,10 @@ class GeneratorWindow(QMainWindow):
         dialog.exec()
 
     def show_interface_help(self):
-        self.show_document("整页更新接口", {
-            "本版": "生成与反馈只使用后端设计，不读取画布快照。只有点击更新原理图才整页重绘。",
-            "宿主": "优先 ClearSchematicPage；或完整 GetItems 枚举 UUID 后 DeleteItems。所有清空和创建都在同一事务。",
-            "缺少能力": "明确报错并保留旧图，不退化为只删一部分旧对象。",
-            "协议": "plugins/protocol/schematic/schematic_clear.proto；docs/手动更新与清空图页接口.md"})
+        QMessageBox.information(self, "原理图操作说明",
+            "更新原理图：将当前设计结果应用到活动图页，替换该页原有内容。\n\n"
+            "清空当前图页：尚无设计结果时，可单独清空活动图页。\n\n"
+            "执行前请保存需要保留的修改；操作完成后可在 KiCad 中撤销。")
 
     def update_schematic(self):
         if not self.switch_service():
@@ -571,13 +570,12 @@ class GeneratorWindow(QMainWindow):
         if not has_graph:
             answer = QMessageBox.question(
                 self, "清空当前图页",
-                "当前没有可应用的设计图。将仅删除当前活动原理图页上的全部内容，"
-                "包括人工绘制的对象；不会生成新图或删除其他图页。是否清空？")
+                "将删除当前原理图页的全部内容。请先保存需要保留的修改。是否清空？")
             if answer == QMessageBox.StandardButton.Yes:
                 self.launch(lambda task: self.workflow.clear_current_page(
                     stop_event=task.stop_event), "正在清空当前原理图页…")
             return
-        answer = QMessageBox.question(self, "更新原理图", "将清空当前活动原理图页的全部旧内容，并按当前后端 Graph IR 重新绘制。人工改动不会保留，也不会传给 AI。是否更新？")
+        answer = QMessageBox.question(self, "更新原理图", "将使用当前设计结果替换当前原理图页的全部内容。请先保存需要保留的修改。是否继续？")
         if answer == QMessageBox.StandardButton.Yes:
             self.launch(lambda task: self.workflow.apply_current_graph(stop_event=task.stop_event), "正在更新当前原理图页…")
 
@@ -591,7 +589,7 @@ class GeneratorWindow(QMainWindow):
     def clear_records(self):
         if not self.switch_service():
             return
-        answer = QMessageBox.question(self, "清除任务记录", "清除本会话的对话、输入、任务和版本记录。不会删除后端文件或当前原理图；绘图收据保留，避免丢失操作状态。继续吗？")
+        answer = QMessageBox.question(self, "清除任务记录", "清除本会话的对话、输入、任务和版本记录；保留当前原理图和服务端文件。是否继续？")
         if answer == QMessageBox.StandardButton.Yes:
             self.workflow.clear_records()
             self.path.clear()
@@ -604,10 +602,10 @@ class GeneratorWindow(QMainWindow):
     def verify_canvas(self):
         if not self.switch_service():
             return
-        answer = QMessageBox.question(self, "处理未确认绘图", "上次绘图响应未知。请先在 KiCad 结束或撤销相关操作，必要时重新打开原理图编辑器。确认已处理，并允许下次按后端结果重新清空整页吗？本操作不检查图纸内容，也不会立即重绘。")
+        answer = QMessageBox.question(self, "处理未确认绘图", "上次原理图操作结果待确认。请先在 KiCad 中检查并结束或撤销该操作，必要时重新打开原理图编辑器。处理完成后，是否允许再次更新原理图？")
         if answer == QMessageBox.StandardButton.Yes:
             self.workflow.permit_full_page_retry(user_confirmed=True)
-            self.status.setText("已允许再次手动更新；尚未读取、核验或重绘当前图页")
+            self.status.setText("已恢复更新入口，可点击“更新原理图”继续")
             self.render()
 
     def recover_legacy(self):
@@ -664,7 +662,7 @@ class GeneratorWindow(QMainWindow):
         label = self.choices.itemText(index)
         if label:
             self.feedback.setPlainText(label)
-        self.status.setText("已将后端候选填入反馈草稿；尚未提交，不定位或读取画布")
+        self.status.setText("建议已填入反馈草稿，可编辑后提交")
 
     def append_conversation(self, role, content):
         if not self.workflow or not str(content).strip():

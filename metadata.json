@@ -2,14 +2,25 @@
   "$schema": "https://go.kicad.org/pcm/schemas/v1",
   "name": "RF EDA AI Schematic Assistant",
   "description": "Create and revise schematics with an AI design service",
-  "description_full": "Compact RF EDA assistant with backend-only feedback, indicator tables and manual schematic updates. AI jobs never draw automatically. Updating clears and redraws the target page inside a transaction, using ClearSchematicPage or complete GetItems/DeleteItems. Requires matching schematic IPC commands; Python packaging cannot add missing host handlers.",
+  "description_full": "A compact RF EDA design assistant for KiCad: generate designs from Word or text, discuss and refine proposals, inspect indicator tables and reports, and apply designs to the schematic with one update action. Includes version history, task recovery and AI service configuration. Uses the matching KiCad schematic IPC build.",
   "identifier": "org.rfeda.ai-schematic-generator",
   "type": "plugin",
-  "author": {"name": "RF EDA contributors", "contact": {}},
-  "maintainer": {"name": "RF EDA contributors", "contact": {}},
+  "author": {
+    "name": "RF EDA contributors",
+    "contact": {}
+  },
+  "maintainer": {
+    "name": "RF EDA contributors",
+    "contact": {}
+  },
   "license": "GPL-3.0",
   "resources": {},
   "versions": [
-    {"version": "0.2.5", "status": "development", "kicad_version": "10.0", "runtime": "ipc"}
+    {
+      "version": "0.2.6",
+      "status": "development",
+      "kicad_version": "10.0",
+      "runtime": "ipc"
+    }
   ]
 }

@@ -934,11 +934,11 @@ def generate(graph: GraphIR, progress: Progress, replace: dict | None = None, *,
         report.created_nodes = list(node_ids)
         report.created_edges = [edge.edge_id for edge in graph.connections]
         report.revision_supported = readback
-        if not readback:
-            report.warnings.append("未进行画布快照或后端对齐；仅核对创建响应中的型号与连接。" if replace_all else "首轮未读取原图内容；仅核对创建响应，不保证避开已有对象。建议使用独立 AI 图页。")
+        if not readback and not replace_all:
+            report.warnings.append("请使用独立图页导入，避免与已有对象重叠。")
         if previous:
             report.warnings.append("已保留稳定节点各单元的坐标和位号；替换后的KiCad对象UUID及映射已更新。")
         if readback:
             report.warnings.append("已核验显式引脚和导线的几何网络；不涵盖全局标签/隐藏电源或完整ERC。")
-        progress("图已创建，UUID 映射已保存；未读取图纸内容。" if not readback else "完整图已导入，图纸快照和对象映射已保存。")
+        progress("原理图已更新，器件与连线已创建。" if not readback else "完整图已导入，对象映射已保存。")
         return report

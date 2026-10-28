@@ -380,7 +380,7 @@ class UiTests(unittest.TestCase):
         self.window.feedback.setPlainText("检查我刚替换的器件")
         self.window.render()
         self.assertTrue(self.window.buttons["feedback"].isEnabled())
-        self.assertIn("后端", self.window.selection_label.text())
+        self.assertFalse(self.window.selection_label.isHidden())
         self.assertTrue(self.window.buttons["interface_help"].isEnabled())
         self.assertTrue(self.window.buttons["finish"].isEnabled())
 
