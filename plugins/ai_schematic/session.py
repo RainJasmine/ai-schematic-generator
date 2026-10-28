@@ -1,4 +1,8 @@
-"""Local non-secret state for resuming AI design jobs and graph revisions."""
+"""Legacy session reader; new UI uses namespaced session_store.SessionStore.
+
+The historical default file is read-only. Explicit paths remain supported for
+legacy integrations/tests, with recursive credential validation and atomic IO.
+"""
 
 from __future__ import annotations
 
@@ -7,27 +11,34 @@ import os
 from pathlib import Path
 import tempfile
 
+from .session_store import MAX_SESSION_BYTES, _assert_secret_free, read_legacy
+
 
 def default_session_path() -> Path:
     base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-    return base / "SunvEDA" / "AI Schematic Generator" / "session.json"
+    return base / "RFEDA" / "AI Schematic Generator" / "legacy-session.json"
 
 
 class SessionStore:
     def __init__(self, path: Path | None = None) -> None:
+        self._explicit_path = path is not None
         self.path = path or default_session_path()
 
     def load(self) -> dict:
         if not self.path.is_file():
             return {}
+        if self.path.stat().st_size > MAX_SESSION_BYTES:
+            raise ValueError("旧会话文件过大")
         value = json.loads(self.path.read_text(encoding="utf-8"))
         if not isinstance(value, dict):
             raise ValueError("本地设计状态格式不正确")
+        _assert_secret_free(value)
         return value
 
     def save(self, state: dict) -> None:
-        if any(key in state for key in ("token", "api_key", "admin_key", "password")):
-            raise ValueError("本地设计状态不能保存访问令牌或密钥")
+        if not self._explicit_path:
+            raise ValueError("历史默认会话只读；请使用按服务和工程隔离的新会话存储")
+        _assert_secret_free(state)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary: Path | None = None
         try:
@@ -35,6 +46,8 @@ class SessionStore:
                                              suffix=".json.part", delete=False) as stream:
                 temporary = Path(stream.name)
                 json.dump(state, stream, ensure_ascii=False, separators=(",", ":"))
+                stream.flush()
+                os.fsync(stream.fileno())
             os.replace(temporary, self.path)
         finally:
             if temporary is not None:

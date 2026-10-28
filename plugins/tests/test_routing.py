@@ -6,6 +6,9 @@ import unittest
 from ai_schematic.layout import SymbolBounds
 from ai_schematic.routing import (
     _intersects_body,
+    _crossing_cost,
+    _point_on_segment,
+    _segments_intersect,
     choose_orientations,
     route,
     rotated_bounds,
@@ -13,6 +16,62 @@ from ai_schematic.routing import (
 
 
 class RoutingTests(unittest.TestCase):
+    def test_grid_detour_keeps_physical_pin_endpoints_exact(self) -> None:
+        source = (-50_000, -50_000, 50_000, 50_000)
+        middle = (130_000, -50_000, 170_000, 50_000)
+        target = (250_000, -50_000, 350_000, 50_000)
+        start, end = (50_003, 7), (250_003, 7)
+        segments = route(start, end, (0, 0), (300_000, 0), source, target,
+                         [source, middle, target], [], grid_nm=25_400)
+        self.assertIsNotNone(segments)
+        self.assertEqual(segments[0][0], start)
+        self.assertEqual(segments[-1][1], end)
+        self.assertFalse(any(_intersects_body(a, b, middle) for a, b in segments))
+
+    def test_search_budget_fails_without_partial_route(self) -> None:
+        source = (-50_000, -50_000, 50_000, 50_000)
+        target = (250_000, -50_000, 350_000, 50_000)
+        self.assertIsNone(route((50_000, 0), (250_000, 0), (0, 0), (300_000, 0),
+                                source, target, [source, target], [], max_search_states=1))
+
+    def test_unrelated_wire_t_contact_is_avoided(self) -> None:
+        source = (-50_000, -50_000, 50_000, 50_000)
+        target = (250_000, -50_000, 350_000, 50_000)
+        existing = ((150_000, 0), (150_000, 100_000))
+        self.assertGreater(_crossing_cost(((50_000, 0), (250_000, 0)), [existing]), 0)
+        segments = route((50_000, 0), (250_000, 0), (0, 0), (300_000, 0),
+                         source, target, [source, target], [existing])
+        self.assertIsNotNone(segments)
+        self.assertFalse(any(_segments_intersect(segment, existing) for segment in segments or []))
+
+    def test_only_explicit_same_net_can_share_a_pin_and_wire(self) -> None:
+        source = (-50_000, -50_000, 50_000, 50_000)
+        target = (250_000, -50_000, 350_000, 50_000)
+        existing = ((50_000, 0), (150_000, 0))
+        args = ((50_000, 0), (250_000, 0), (0, 0), (300_000, 0),
+                source, target, [source, target], [existing])
+        self.assertIsNone(route(*args))
+        self.assertIsNone(route(*args, net_id="new-net", occupied_nets=["other-net"]))
+        same = route(*args, net_id="shared-net", occupied_nets=["shared-net"])
+        self.assertIsNotNone(same)
+        self.assertTrue(any(_segments_intersect(segment, existing) for segment in same or []))
+
+    def test_escape_leg_cannot_cross_a_third_body(self) -> None:
+        source = (-50_000, -50_000, 50_000, 50_000)
+        target = (250_000, -50_000, 350_000, 50_000)
+        blocker = (55_000, -10_000, 58_000, 10_000)
+        self.assertIsNone(route((50_000, 0), (250_000, 0), (0, 0), (300_000, 0),
+                                source, target, [source, target, blocker], []))
+
+    def test_unrelated_unused_pin_is_not_crossed(self) -> None:
+        source = (-50_000, -50_000, 50_000, 50_000)
+        target = (250_000, -50_000, 350_000, 50_000)
+        pin = (150_000, 0)
+        segments = route((50_000, 0), (250_000, 0), (0, 0), (300_000, 0),
+                         source, target, [source, target], [], forbidden_points={pin})
+        self.assertIsNotNone(segments)
+        self.assertFalse(any(_point_on_segment(pin, segment) for segment in segments or []))
+
     def test_rotation_points_a_single_output_pin_toward_its_peer(self) -> None:
         pin = SimpleNamespace(number="1", position=SimpleNamespace(x_nm=50_000, y_nm=0))
         variant = SimpleNamespace(unit=1, body_style=1, pins=[pin])

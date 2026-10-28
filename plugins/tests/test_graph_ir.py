@@ -17,6 +17,60 @@ from ai_schematic.layout import (
 
 
 class GraphIrTests(unittest.TestCase):
+    def test_explicit_failed_or_pending_graph_is_not_deliverable(self) -> None:
+        for status in ("failed", "blocked", "pending_validation"):
+            with self.subTest(status=status):
+                graph = GraphIR.parse({"task6_status": status, "nodes": [{"node_id": "A"}], "edges": []})
+                self.assertTrue(any(d.code == "GRAPH_NOT_DELIVERABLE" for d in graph.diagnostics))
+        graph = GraphIR.parse({"task6_status": "completed", "nodes": [{"node_id": "A"}], "edges": [],
+                               "conversion_report_summary": {"task6_status": "failed"}})
+        self.assertTrue(graph.errors)
+
+    def test_binding_and_erc_error_evidence_cannot_be_ignored(self) -> None:
+        for node in ({"node_id": "A", "binding_status": "unresolved"},
+                     {"node_id": "A", "model_binding_status": "blocked"},
+                     {"node_id": "A", "binding_status": "bound", "binding_errors": ["MISSING_MODEL"]}):
+            with self.subTest(node=node):
+                self.assertTrue(GraphIR.parse({"nodes": [node], "edges": []}).errors)
+        for erc in ({"status": "failed"}, {"counts": {"errors": 1}}, {"error_count": 2},
+                    {"errors": [{"code": "ERC_ENDPOINT_PIN_MISSING"}]}, {"counts": {"errors": "0"}}):
+            with self.subTest(erc=erc):
+                self.assertTrue(GraphIR.parse({"nodes": [{"node_id": "A"}], "edges": [], "erc_summary": erc}).errors)
+
+    def test_future_v2_minor_and_warning_only_completion_remain_compatible(self) -> None:
+        raw = {"graph_schema": "ai-eda-graph-ir/v2.9", "schema_version": "2.9", "task6_status": "completed_with_warnings",
+               "nodes": [{"node_id": "A", "binding_status": "bound", "parameter_values": None}], "edges": [],
+               "erc_summary": {"status": "completed_with_warnings", "counts": {"errors": 0, "warnings": 3}},
+               "future_extension": {"some_field": 42}}
+        graph = GraphIR.parse(raw)
+        self.assertFalse(graph.errors)
+        self.assertEqual(graph.source["future_extension"], {"some_field": 42})
+
+    def test_variant_ids_are_strict_nonnegative_integers(self) -> None:
+        for field in ("unit", "body_style"):
+            for value in (-1, True, 1.5, 1.0, "1", "invalid"):
+                with self.subTest(field=field, value=value):
+                    graph = GraphIR.parse({"nodes": [{"node_id": "A", "ports": [{"port_id": "P", field: value}]}], "edges": []})
+                    self.assertTrue(any(d.code == f"PORT_{field.upper()}_INVALID" for d in graph.diagnostics))
+        graph = GraphIR.parse({"nodes": [{"node_id": "A", "ports": [{"port_id": "P", "unit": 0, "body_style": 0}]}], "edges": []})
+        self.assertFalse(graph.errors)
+        self.assertEqual((graph.nodes[0].ports[0].unit, graph.nodes[0].ports[0].body_style), (0, 0))
+
+    def test_invalid_model_metadata_and_solved_values_are_rejected(self) -> None:
+        for extra in ({"model_metadata": []}, {"parameter_values": {"gain": 10}}):
+            with self.subTest(extra=extra):
+                self.assertTrue(GraphIR.parse({"nodes": [{"node_id": "A", **extra}], "edges": []}).errors)
+
+    def test_critical_signal_direction_and_domain_conflicts_block_import(self) -> None:
+        raw = {"nodes": [
+            {"node_id": "A", "ports": [{"port_id": "P", "direction": "input", "domain": "DC"}]},
+            {"node_id": "B", "ports": [{"port_id": "P", "direction": "output", "domain": "DC"}]},
+        ], "edges": [{"edge_id": "E", "edge_type": "signal", "signal_domain": "RF",
+                       "source_node_id": "A", "source_port_id": "P", "target_node_id": "B", "target_port_id": "P"}]}
+        graph = GraphIR.parse(raw)
+        self.assertTrue(any(d.severity == "error" and d.code == "PORT_DIRECTION_SUSPICIOUS" for d in graph.diagnostics))
+        self.assertTrue(any(d.severity == "error" and d.code == "PORT_DOMAIN_MISMATCH" for d in graph.diagnostics))
+
     def _load(self, value: object) -> GraphIR:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "graph.json"
@@ -347,10 +401,60 @@ class GraphIrTests(unittest.TestCase):
         self.assertEqual(max(box[2] for box in absolute.values()), 300_000 + layout.width_nm)
         self.assertEqual(max(box[3] for box in absolute.values()), 300_000 + layout.height_nm)
         self.assertEqual((layout.origin_x_nm, layout.origin_y_nm), (300_000, 300_000))
-        self.assertEqual(layout.positions["B"][0] - layout.positions["A"][0], 100_000)
-        self.assertEqual(layout.positions["D2"][1] - layout.positions["B"][1], 50_000)
-        self.assertEqual(layout.positions["D1"][1] - layout.positions["D2"][1], 50_000)
-        self.assertEqual(layout.positions["U1"][1] - layout.positions["B"][1], -50_000)
+        self.assertGreaterEqual(layout.positions["B"][0] - layout.positions["A"][0], 100_000)
+        self.assertGreaterEqual(layout.positions["D2"][1] - layout.positions["B"][1], 50_000)
+        self.assertGreaterEqual(layout.positions["D1"][1] - layout.positions["D2"][1], 50_000)
+        self.assertLessEqual(layout.positions["U1"][1] - layout.positions["B"][1], -50_000)
+        self._assert_nonoverlap(absolute)
+
+    def _assert_nonoverlap(self, boxes: dict) -> None:
+        values = list(boxes.items())
+        for index, (first_id, first) in enumerate(values):
+            for second_id, second in values[index + 1:]:
+                with self.subTest(first=first_id, second=second_id):
+                    self.assertFalse(first[0] < second[2] and first[2] > second[0]
+                                     and first[1] < second[3] and first[3] > second[1])
+
+    def _boxes(self, layout: object, bounds: dict) -> dict:
+        return {node_id: (layout.positions[node_id][0] + box.left,
+                          layout.positions[node_id][1] + box.top,
+                          layout.positions[node_id][0] + box.right,
+                          layout.positions[node_id][1] + box.bottom)
+                for node_id, box in bounds.items()}
+
+    def test_large_symbol_bounds_expand_spacing_instead_of_overlapping(self) -> None:
+        graph = GraphIR.parse({"nodes": [{"node_id": n} for n in ("A", "B")], "edges": [],
+                               "paths": [{"path_id": "main", "path_type": "main_signal",
+                                          "ordered_nodes": ["A", "B"]}]})
+        bounds = {n: SymbolBounds(-200_000, -50_000, 400_000, 100_000) for n in ("A", "B")}
+        layout = layout_symbols_in_origin_rectangle(graph, list(bounds), bounds)
+        self._assert_nonoverlap(self._boxes(layout, bounds))
+        self.assertGreater(layout.positions["B"][0] - layout.positions["A"][0], 400_000)
+
+    def test_third_and_nested_branches_keep_separate_lanes(self) -> None:
+        names = ("A", "B", "C", "D", "N")
+        graph = GraphIR.parse({"nodes": [{"node_id": n} for n in names], "edges": [], "paths": [
+            {"path_id": "main", "path_type": "main_signal", "ordered_nodes": ["A"]},
+            {"path_id": "nested", "path_type": "branch", "ordered_nodes": ["N", "B"]},
+            *[{"path_id": n, "path_type": "branch", "ordered_nodes": [n, "A"]} for n in ("B", "C", "D")],
+        ]})
+        bounds = {n: SymbolBounds(-50_000, -50_000, 100_000, 100_000) for n in names}
+        layout = layout_symbols_in_origin_rectangle(graph, list(bounds), bounds)
+        self.assertEqual(set(layout.positions), set(names))
+        self._assert_nonoverlap(self._boxes(layout, bounds))
+        self.assertNotEqual(layout.positions["D"][1], layout.positions["A"][1])
+        self.assertNotEqual(layout.positions["N"][1], layout.positions["A"][1])
+
+    def test_layout_preserves_host_grid_and_rejects_explicit_paper_overflow(self) -> None:
+        graph = GraphIR.parse({"nodes": [{"node_id": n} for n in ("A", "B")], "edges": []})
+        bounds = {n: SymbolBounds(-30_333, -20_111, 100_777, 70_999) for n in ("A", "B")}
+        layout = layout_symbols_in_origin_rectangle(graph, list(bounds), bounds, grid_nm=(25_400, 12_700))
+        self.assertTrue(all(x % 25_400 == 0 and y % 12_700 == 0 for x, y in layout.positions.values()))
+        self.assertGreaterEqual(layout.origin_x_nm, 300_000)
+        self.assertGreaterEqual(layout.origin_y_nm, 300_000)
+        self._assert_nonoverlap(self._boxes(layout, bounds))
+        with self.assertRaisesRegex(ValueError, "LAYOUT_PAGE_OVERFLOW"):
+            layout_symbols_in_origin_rectangle(graph, list(bounds), bounds, page_bounds=(0, 0, 1000, 1000))
 
 
 if __name__ == "__main__":

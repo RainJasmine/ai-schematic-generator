@@ -8,9 +8,12 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
-from ai_schematic.ai_service import (AiServiceError, download_html_report, get_revision_state,
-                                     submit_revision, submit_text_job, wait_for_job,
-                                     resume_job, upload_word)
+from ai_schematic.ai_service import (
+    AiServiceError, ServiceClient, WaitingStopped, _NoRedirect, _opener,
+    download_html_report, resume_job, upload_word, get_revision_state, submit_revision, submit_text_job, wait_for_job,
+)
+from threading import Event
+from urllib.request import HTTPRedirectHandler, Request
 
 
 class FakeOpener:
@@ -82,6 +85,7 @@ class AiServiceTests(unittest.TestCase):
         self.assertIn(b'name="user_text"', post.data)
         self.assertIn("补充要求".encode(), post.data)
         self.assertIn(b'name="run_name"', post.data)
+        self.assertIn(b'name="request_id"', post.data)
         self.assertEqual([request.get_header("Authorization") for request, _ in opener.requests],
                          ["Bearer secret"] * 4)
         sleep.assert_called_once_with(2)
@@ -170,6 +174,115 @@ class AiServiceTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), b"previous report")
             self.assertEqual(list(Path(directory).iterdir()), [destination])
 
+    def test_text_create_keeps_explicit_request_id_and_does_not_retry_post(self) -> None:
+        opener = FakeOpener(URLError("response lost"))
+        with patch("ai_schematic.ai_service.build_opener", return_value=opener):
+            with self.assertRaises(AiServiceError) as error:
+                ServiceClient("http://127.0.0.1:8000").submit_text("设计接收链路", request_id="create-001")
+        self.assertEqual(error.exception.code, "CONNECTION_FAILED")
+        self.assertEqual(len(opener.requests), 1)
+        self.assertEqual(json.loads(opener.requests[0][0].data)["request_id"], "create-001")
+
+    def test_upload_reads_current_service_limit(self) -> None:
+        opener = FakeOpener({"max_upload_bytes": 3})
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("ai_schematic.ai_service.build_opener", return_value=opener):
+                with self.assertRaises(AiServiceError) as error:
+                    ServiceClient("http://127.0.0.1:8000").submit_word(self._word(directory), request_id="create-002")
+        self.assertEqual(error.exception.code, "UPLOAD_TOO_LARGE")
+        self.assertEqual(len(opener.requests), 1)
+        self.assertTrue(opener.requests[0][0].full_url.endswith("/capabilities"))
+
+    def test_needs_attention_is_a_normal_terminal_response(self) -> None:
+        terminal = self._job("needs_attention", error=None,
+                             summary={"interaction_status": "awaiting_input", "message": "选择本振方案"})
+        opener = FakeOpener(terminal)
+        with patch("ai_schematic.ai_service.build_opener", return_value=opener):
+            result = ServiceClient("http://127.0.0.1:8000").follow_job("a" * 32)
+        self.assertEqual(result, terminal)
+        self.assertEqual(result["summary"]["interaction_status"], "awaiting_input")
+
+    def test_failed_is_a_normal_terminal_response(self) -> None:
+        terminal = self._job("failed", error={"code": "WORKER_FAILED", "message": "worker stopped"})
+        with patch("ai_schematic.ai_service.build_opener", return_value=FakeOpener(terminal)):
+            result = ServiceClient("http://127.0.0.1:8000").follow_job("a" * 32)
+        self.assertEqual(result["error"]["code"], "WORKER_FAILED")
+
+    def test_stop_wait_never_sends_cancellation_or_query(self) -> None:
+        stopped = Event()
+        stopped.set()
+        opener = FakeOpener()
+        with patch("ai_schematic.ai_service.build_opener", return_value=opener):
+            with self.assertRaises(WaitingStopped):
+                ServiceClient("http://127.0.0.1:8000").follow_job("a" * 32, stop_event=stopped)
+        self.assertEqual(opener.requests, [])
+
+    def test_structured_http_error_keeps_conflict_fields(self) -> None:
+        body = b'{"error":{"code":"GRAPH_HASH_MISMATCH","message":"changed","details":{"revision":2}}}'
+        error = HTTPError("http://127.0.0.1:8000/test", 409, "Conflict", {"Retry-After": "5"}, BytesIO(body))
+        with patch("ai_schematic.ai_service.build_opener", return_value=FakeOpener(error)):
+            with self.assertRaises(AiServiceError) as caught:
+                ServiceClient("http://127.0.0.1:8000").revision_state("a" * 32)
+        self.assertEqual(caught.exception.code, "GRAPH_HASH_MISMATCH")
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.details, {"revision": 2})
+        self.assertEqual(caught.exception.retry_after, "5")
+
+    def test_redirect_handler_blocks_even_foreign_https_without_forwarding_token(self) -> None:
+        opener = _opener()
+        redirect_handlers = [handler for handler in opener.handlers if isinstance(handler, HTTPRedirectHandler)]
+        self.assertEqual(len(redirect_handlers), 1)
+        self.assertIsInstance(redirect_handlers[0], _NoRedirect)
+        request = Request("http://127.0.0.1:8000/report", headers={"Authorization": "Bearer secret"})
+        with self.assertRaises(AiServiceError) as error:
+            redirect_handlers[0].redirect_request(request, None, 302, "Found", {}, "https://foreign.example/report")
+        self.assertEqual(error.exception.code, "REDIRECT_BLOCKED")
+
+    def test_admin_header_is_sent_only_for_management_calls(self) -> None:
+        opener = FakeOpener({}, {})
+        with patch("ai_schematic.ai_service.build_opener", return_value=opener):
+            client = ServiceClient("http://127.0.0.1:8000", token="access", admin_key="manage")
+            client.health()
+            client.configuration()
+        self.assertIsNone(opener.requests[0][0].get_header("X-ai-eda-admin-key"))
+        self.assertEqual(opener.requests[1][0].get_header("X-ai-eda-admin-key"), "manage")
+        self.assertEqual(opener.requests[1][0].get_header("Authorization"), "Bearer access")
+
+    def test_result_job_identity_must_match_requested_id(self) -> None:
+        with patch("ai_schematic.ai_service.build_opener", return_value=FakeOpener(self._job("succeeded"))):
+            with self.assertRaises(AiServiceError) as error:
+                ServiceClient("http://127.0.0.1:8000").get_job("b" * 32)
+        self.assertEqual(error.exception.code, "JOB_ID_MISMATCH")
+
+    def test_html_download_rejects_non_html_and_preserves_existing_file(self) -> None:
+        for media in ("application/json", "application/octet-stream", "text/plain", ""):
+            with self.subTest(media=media), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "report.html"
+                output.write_bytes(b"old")
+                with patch("ai_schematic.ai_service.build_opener", return_value=HtmlOpener(b"new", media)):
+                    with self.assertRaises(AiServiceError):
+                        ServiceClient("http://127.0.0.1:8000").download_html("/report", output)
+                self.assertEqual(output.read_bytes(), b"old")
+
+    def test_html_download_size_limit_preserves_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.html"
+            output.write_bytes(b"old")
+            with patch("ai_schematic.ai_service.MAX_REPORT_BYTES", 3), \
+                 patch("ai_schematic.ai_service.build_opener", return_value=HtmlOpener(b"1234")):
+                with self.assertRaises(AiServiceError) as error:
+                    ServiceClient("http://127.0.0.1:8000").download_html("/report", output)
+            self.assertEqual(error.exception.code, "REPORT_TOO_LARGE")
+            self.assertEqual(output.read_bytes(), b"old")
+            self.assertEqual(list(Path(directory).iterdir()), [output])
+
+    def test_service_address_cannot_embed_credentials(self) -> None:
+        with self.assertRaises(AiServiceError):
+            ServiceClient("http://user:password@127.0.0.1:8000")
+
+
+
+
     def test_text_submission_and_needs_attention_are_distinct_from_http_failure(self) -> None:
         accepted = self._job("queued")
         terminal = self._job("needs_attention", summary={"interaction_status": "awaiting_input"},
@@ -203,7 +316,6 @@ class AiServiceTests(unittest.TestCase):
         self.assertEqual(payload["selection"]["node_ids"], ["N1"])
         self.assertFalse(payload["client_graph_dirty"])
         self.assertNotIn("finish", payload)
-
 
 if __name__ == "__main__":
     unittest.main()

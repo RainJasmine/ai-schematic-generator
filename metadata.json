@@ -1,15 +1,15 @@
 {
   "$schema": "https://go.kicad.org/pcm/schemas/v1",
-  "name": "AI Schematic Generator",
+  "name": "RF EDA AI Schematic Assistant",
   "description": "Create and revise schematics with an AI design service",
-  "description_full": "Start a design from Word, text, or local Graph IR JSON; discuss revisions with a FastAPI service and safely replace plugin-managed symbols and wires on the active schematic sheet.",
-  "identifier": "com.sunveda.kicad-ai-schematic-generator",
+  "description_full": "Compact RF EDA assistant with backend-only feedback, indicator tables and manual schematic updates. AI jobs never draw automatically. Updating clears and redraws the target page inside a transaction, using ClearSchematicPage or complete GetItems/DeleteItems. Requires matching schematic IPC commands; Python packaging cannot add missing host handlers.",
+  "identifier": "org.rfeda.ai-schematic-generator",
   "type": "plugin",
-  "author": {"name": "SunvEDA contributors", "contact": {}},
-  "maintainer": {"name": "SunvEDA contributors", "contact": {}},
+  "author": {"name": "RF EDA contributors", "contact": {}},
+  "maintainer": {"name": "RF EDA contributors", "contact": {}},
   "license": "GPL-3.0",
   "resources": {},
   "versions": [
-    {"version": "0.2.0", "status": "development", "kicad_version": "9.0", "runtime": "ipc"}
+    {"version": "0.2.4", "status": "development", "kicad_version": "10.0", "runtime": "ipc"}
   ]
 }

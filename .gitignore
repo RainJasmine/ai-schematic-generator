@@ -1,1 +1,8 @@
 *.zip
+
+# Local build products, caches and backups
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+backups/

@@ -87,27 +87,39 @@ def _escape(pin: Point, origin: Point, box: tuple[int, int, int, int], peer: Poi
     if dx == dy == 0:
         dx, dy = peer[0] - pin[0], peer[1] - pin[1]
     if abs(dx) >= abs(dy):
-        return (box[2] + CLEARANCE if dx >= 0 else box[0] - CLEARANCE, pin[1])
-    return (pin[0], box[3] + CLEARANCE if dy >= 0 else box[1] - CLEARANCE)
+        return (max(pin[0], box[2]) + CLEARANCE if dx >= 0
+                else min(pin[0], box[0]) - CLEARANCE, pin[1])
+    return (pin[0], max(pin[1], box[3]) + CLEARANCE if dy >= 0
+            else min(pin[1], box[1]) - CLEARANCE)
+
+
+def _point_on_segment(point: Point, segment: Segment) -> bool:
+    a, b = segment
+    return ((b[0] - a[0]) * (point[1] - a[1]) == (b[1] - a[1]) * (point[0] - a[0])
+            and min(a[0], b[0]) <= point[0] <= max(a[0], b[0])
+            and min(a[1], b[1]) <= point[1] <= max(a[1], b[1]))
+
+
+def _segments_intersect(first: Segment, second: Segment) -> bool:
+    """Inclusive contact test: T junctions and single shared endpoints count."""
+    a, b = first
+    c, d = second
+
+    def cross(p: Point, q: Point, r: Point) -> int:
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    ab_c, ab_d, cd_a, cd_b = cross(a, b, c), cross(a, b, d), cross(c, d, a), cross(c, d, b)
+    if ((ab_c > 0 > ab_d or ab_d > 0 > ab_c)
+            and (cd_a > 0 > cd_b or cd_b > 0 > cd_a)):
+        return True
+    return ((ab_c == 0 and _point_on_segment(c, first))
+            or (ab_d == 0 and _point_on_segment(d, first))
+            or (cd_a == 0 and _point_on_segment(a, second))
+            or (cd_b == 0 and _point_on_segment(b, second)))
 
 
 def _crossing_cost(segment: Segment, occupied: list[Segment]) -> int:
-    (a, b) = segment
-    cost = 0
-    for c, d in occupied:
-        if a[1] == b[1] and c[1] == d[1] and a[1] == c[1]:
-            if max(min(a[0], b[0]), min(c[0], d[0])) < min(max(a[0], b[0]), max(c[0], d[0])):
-                cost += CROSSING_COST
-        elif a[0] == b[0] and c[0] == d[0] and a[0] == c[0]:
-            if max(min(a[1], b[1]), min(c[1], d[1])) < min(max(a[1], b[1]), max(c[1], d[1])):
-                cost += CROSSING_COST
-        elif a[1] == b[1] and c[0] == d[0]:
-            if min(a[0], b[0]) < c[0] < max(a[0], b[0]) and min(c[1], d[1]) < a[1] < max(c[1], d[1]):
-                cost += CROSSING_COST
-        elif a[0] == b[0] and c[1] == d[1]:
-            if min(a[1], b[1]) < c[1] < max(a[1], b[1]) and min(c[0], d[0]) < a[0] < max(c[0], d[0]):
-                cost += CROSSING_COST
-    return cost
+    return CROSSING_COST * sum(_segments_intersect(segment, other) for other in occupied)
 
 
 def _compress(points: list[Point]) -> list[Segment]:
@@ -125,17 +137,71 @@ def _compress(points: list[Point]) -> list[Segment]:
 
 def route(start: Point, end: Point, source_origin: Point, target_origin: Point,
           source_box: tuple[int, int, int, int], target_box: tuple[int, int, int, int],
-          obstacles: list[tuple[int, int, int, int]], occupied: list[Segment]) -> list[Segment] | None:
-    """Find a low-crossing Manhattan route outside symbol bodies."""
+          obstacles: list[tuple[int, int, int, int]], occupied: list[Segment], *,
+          net_id: str = "", occupied_nets: list[str] | None = None,
+          forbidden_points: set[Point] | None = None,
+          grid_nm: int | tuple[int, int] = 0,
+          max_search_states: int = 200_000) -> list[Segment] | None:
+    """Route an orthogonal connection with hard electrical contact protection.
+
+    Every intersection with an unrelated/unknown net is forbidden, including T
+    contacts and endpoint touches.  Contact or shared wire is permitted only
+    when the caller explicitly supplies the same nonempty electrical net ID.
+    Source/target escape legs undergo the same checks as the searched path.
+    Library pin angles are not exposed by this protocol; the escape direction
+    therefore remains a geometric heuristic and never bypasses an obstacle.
+    """
+    if occupied_nets is not None and len(occupied_nets) != len(occupied):
+        raise ValueError("occupied_nets must align with occupied segments")
+    if type(max_search_states) is not int or max_search_states < 1:
+        raise ValueError("max_search_states must be a positive integer")
+    if isinstance(grid_nm, tuple):
+        grid_x, grid_y = (max(0, int(value)) for value in grid_nm)
+    else:
+        grid_x = grid_y = max(0, int(grid_nm))
+
+    def floor_grid(value: int, grid: int) -> int:
+        return value // grid * grid if grid else value
+
+    def ceil_grid(value: int, grid: int) -> int:
+        return -((-value) // grid) * grid if grid else value
+
+    def escaped(pin: Point, origin: Point, box, peer: Point) -> Point:
+        point = _escape(pin, origin, box, peer)
+        if point[0] != pin[0]:
+            return (ceil_grid(point[0], grid_x) if point[0] > pin[0]
+                    else floor_grid(point[0], grid_x), pin[1])
+        return (pin[0], ceil_grid(point[1], grid_y) if point[1] > pin[1]
+                else floor_grid(point[1], grid_y))
+    other_wires = [segment for index, segment in enumerate(occupied)
+                   if not (net_id and occupied_nets is not None and occupied_nets[index] == net_id)]
+    blocked_points = set(forbidden_points or ()) - {start, end}
+
+    def wire_blocked(segment: Segment) -> bool:
+        return (any(_segments_intersect(segment, other) for other in other_wires)
+                or any(_point_on_segment(point, segment) for point in blocked_points))
+
     if start == end:
-        return []
-    departure = _escape(start, source_origin, source_box, end)
-    arrival = _escape(end, target_origin, target_box, start)
-    xs = {departure[0], arrival[0], (departure[0] + arrival[0]) // 2}
-    ys = {departure[1], arrival[1], (departure[1] + arrival[1]) // 2}
+        return [] if not wire_blocked((start, end)) else None
+    departure = escaped(start, source_origin, source_box, end)
+    arrival = escaped(end, target_origin, target_box, start)
+    source_leg, target_leg = (start, departure), (arrival, end)
+    if (any(_intersects_body(*source_leg, box) for box in obstacles if box != source_box)
+            or any(_intersects_body(*target_leg, box) for box in obstacles if box != target_box)
+            or wire_blocked(source_leg) or wire_blocked(target_leg)):
+        return None
+    xs = {departure[0], arrival[0], floor_grid((departure[0] + arrival[0]) // 2, grid_x)}
+    ys = {departure[1], arrival[1], floor_grid((departure[1] + arrival[1]) // 2, grid_y)}
     for left, top, right, bottom in obstacles:
-        xs.update((left - CLEARANCE, right + CLEARANCE))
-        ys.update((top - CLEARANCE, bottom + CLEARANCE))
+        xs.update((floor_grid(left - CLEARANCE, grid_x), ceil_grid(right + CLEARANCE, grid_x)))
+        ys.update((floor_grid(top - CLEARANCE, grid_y), ceil_grid(bottom + CLEARANCE, grid_y)))
+    for a, b in other_wires:
+        for point in (a, b):
+            xs.update((floor_grid(point[0] - CLEARANCE, grid_x), point[0], ceil_grid(point[0] + CLEARANCE, grid_x)))
+            ys.update((floor_grid(point[1] - CLEARANCE, grid_y), point[1], ceil_grid(point[1] + CLEARANCE, grid_y)))
+    for x, y in blocked_points:
+        xs.update((floor_grid(x - CLEARANCE, grid_x), ceil_grid(x + CLEARANCE, grid_x)))
+        ys.update((floor_grid(y - CLEARANCE, grid_y), ceil_grid(y + CLEARANCE, grid_y)))
     x_values, y_values = sorted(xs), sorted(ys)
     x_index = {value: index for index, value in enumerate(x_values)}
     y_index = {value: index for index, value in enumerate(y_values)}
@@ -159,14 +225,17 @@ def route(start: Point, end: Point, source_origin: Point, target_origin: Point,
             if not (0 <= nx < len(x_values) and 0 <= ny < len(y_values)):
                 continue
             next_point = (x_values[nx], y_values[ny])
-            if any(_intersects_body(point, next_point, box) for box in obstacles):
+            segment = (point, next_point)
+            if (any(_intersects_body(point, next_point, box) for box in obstacles)
+                    or wire_blocked(segment)):
                 continue
             next_state = (nx, ny, axis)
             step = (abs(next_point[0] - point[0]) + abs(next_point[1] - point[1])
-                    + (BEND_COST if direction and direction != axis else 0)
-                    + _crossing_cost((point, next_point), occupied))
+                    + (BEND_COST if direction and direction != axis else 0))
             next_cost = cost + step
             if next_cost < distance.get(next_state, 1 << 62):
+                if next_state not in distance and len(distance) >= max_search_states:
+                    return None  # Bounded planning failure, never partial output.
                 distance[next_state] = next_cost
                 previous[next_state] = state
                 heappush(queue, (next_cost, next_state))
@@ -178,4 +247,15 @@ def route(start: Point, end: Point, source_origin: Point, target_origin: Point,
         finish = previous[finish]
     points.append(departure)
     points.reverse()
-    return _compress([start, *points, end])
+    segments = _compress([start, *points, end])
+    # Compression must never turn a safe searched path into an unsafe result.
+    for index, segment in enumerate(segments):
+        exempt = set()
+        if index == 0:
+            exempt.add(source_box)
+        if index == len(segments) - 1:
+            exempt.add(target_box)
+        if (wire_blocked(segment)
+                or any(_intersects_body(*segment, box) for box in obstacles if box not in exempt)):
+            return None
+    return segments

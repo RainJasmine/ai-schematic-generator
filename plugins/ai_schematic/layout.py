@@ -123,139 +123,149 @@ def layout_symbols_in_origin_rectangle(
     vertical_step_nm: int = SYMBOL_VERTICAL_STEP_NM,
     origin_x_nm: int = LAYOUT_ORIGIN_OFFSET_NM,
     origin_y_nm: int = LAYOUT_ORIGIN_OFFSET_NM,
+    *,
+    grid_nm: int | tuple[int, int] = 0,
+    page_bounds: tuple[int, int, int, int] | None = None,
+    clearance_nm: int = 2 * SCHEMATIC_IU_PER_MM,
 ) -> OriginLayout:
-    """Lay out symbols by topology and move their union to the page margin.
+    """Lay out all topology paths without symbol-body collisions.
 
-    Main-chain and otherwise unassigned nodes extend along +X.  For each main
-    anchor, the first branch extends along +Y and the second along -Y.  Fixed
-    origin-to-origin steps control density; bounding boxes may overlap and are
-    used only to normalize the visible union to the configured page margin.
+    Steps are minimum center spacing, enlarged for actual body dimensions.
+    Branches keep their own lanes, including third and nested branches; shared
+    nodes are placed once.  Optional grid/page values use the same units as the
+    captured host context.  A viewport is not a paper boundary.  If explicit
+    paper bounds cannot contain the result, fail instead of clipping objects.
     """
-    available = [node_id for node_id in node_ids if node_id in bounds]
+    available = list(dict.fromkeys(node_id for node_id in node_ids if node_id in bounds))
     if not available:
         return OriginLayout({}, 0, 0, origin_x_nm, origin_y_nm)
-
     allowed = set(available)
-    main_nodes: list[str] = []
-    for path in graph.main_paths:
-        for node_id in path.ordered_nodes:
-            if node_id in allowed and node_id not in main_nodes:
-                main_nodes.append(node_id)
-
-    main_set = set(main_nodes)
-    branches_by_anchor: dict[str, list[list[str]]] = {}
-    assigned_branch_nodes: set[str] = set()
-    for path in graph.branches:
-        anchor = next(
-            (node_id for node_id in path.anchor_node_ids if node_id in main_set),
-            None,
-        )
-        if anchor is None or len(branches_by_anchor.get(anchor, [])) >= 2:
-            continue
-        branch_nodes = [
-            node_id
-            for node_id in _nodes_from_anchor(path, anchor)
-            if node_id in allowed
-            and node_id not in main_set
-            and node_id not in assigned_branch_nodes
-        ]
-        if not branch_nodes:
-            continue
-        branches_by_anchor.setdefault(anchor, []).append(branch_nodes)
-        assigned_branch_nodes.update(branch_nodes)
-
-    # Nodes outside the supported main/two-one-level-branches shape remain
-    # drawable and are appended to the +X row instead of being discarded.
-    row_nodes = list(main_nodes)
-    row_nodes.extend(
-        node_id
-        for node_id in placement_order(graph)
-        if node_id in allowed
-        and node_id not in row_nodes
-        and node_id not in assigned_branch_nodes
-    )
-    row_nodes.extend(
-        node_id
-        for node_id in available
-        if node_id not in row_nodes and node_id not in assigned_branch_nodes
-    )
-    if not row_nodes:
-        row_nodes = [available[0]]
-        assigned_branch_nodes.discard(available[0])
-
+    if isinstance(grid_nm, tuple):
+        grid_x, grid_y = (max(0, int(value)) for value in grid_nm)
+    else:
+        grid_x = grid_y = max(0, int(grid_nm))
+    step_x = max(1, int(horizontal_step_nm))
+    step_y = max(1, int(vertical_step_nm))
+    gap = max(1, int(clearance_nm))
     origins: dict[str, tuple[int, int]] = {}
-    placed_boxes: dict[str, tuple[int, int, int, int]] = {}
-    cursor_x = 0
+    boxes: dict[str, tuple[int, int, int, int]] = {}
 
-    def place(node_id: str, box_left: int, box_top: int) -> None:
+    def shift_on_grid(delta: int, grid: int) -> int:
+        return -((-delta) // grid) * grid if grid else delta
+
+    def collides(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+        return a[0] < b[2] + gap and a[2] + gap > b[0] and a[1] < b[3] + gap and a[3] + gap > b[1]
+
+    def place(node_id: str, center_x: int, center_y: int, axis: int = 0, sign: int = 1) -> None:
         geometry = bounds[node_id]
-        origins[node_id] = (
-            box_left - geometry.left,
-            box_top - geometry.top,
-        )
-        placed_boxes[node_id] = (
-            box_left,
-            box_top,
-            box_left + geometry.width,
-            box_top + geometry.height,
-        )
+        x = _snap(center_x - geometry.left - geometry.width // 2, grid_x)
+        y = _snap(center_y - geometry.top - geometry.height // 2, grid_y)
+        # Each iteration moves past at least one occupied box in a monotonic
+        # direction; this also makes asymmetric and large symbols safe.
+        while True:
+            box = (x + geometry.left, y + geometry.top,
+                   x + geometry.right, y + geometry.bottom)
+            conflicts = [other for other in boxes.values() if collides(box, other)]
+            if not conflicts:
+                break
+            if axis == 0:
+                delta = (max(other[2] + gap - box[0] for other in conflicts)
+                         if sign > 0 else max(box[2] + gap - other[0] for other in conflicts))
+                x += sign * shift_on_grid(max(1, delta), grid_x)
+            else:
+                delta = (max(other[3] + gap - box[1] for other in conflicts)
+                         if sign > 0 else max(box[3] + gap - other[1] for other in conflicts))
+                y += sign * shift_on_grid(max(1, delta), grid_y)
+        origins[node_id] = (x, y)
+        boxes[node_id] = box
 
-    for row_node in row_nodes:
-        branch_paths = branches_by_anchor.get(row_node, [])
-        column_center_x = cursor_x
+    def center(node_id: str) -> tuple[int, int]:
+        box = boxes[node_id]
+        return ((box[0] + box[2]) // 2, (box[1] + box[3]) // 2)
 
-        main_geometry = bounds[row_node]
-        main_left = column_center_x - main_geometry.width // 2
-        main_top = -(main_geometry.height // 2)
-        place(row_node, main_left, main_top)
+    def place_row(ordered: list[str], row_y: int) -> None:
+        previous: str | None = None
+        for node_id in ordered:
+            if node_id not in allowed:
+                continue
+            if node_id in origins:
+                previous = node_id
+                continue
+            desired_x = center(previous)[0] + step_x if previous else 0
+            place(node_id, desired_x, row_y)
+            previous = node_id
 
-        if branch_paths:
-            for index, node_id in enumerate(branch_paths[0], start=1):
-                geometry = bounds[node_id]
-                center_y = index * vertical_step_nm
-                place(
-                    node_id,
-                    column_center_x - geometry.width // 2,
-                    center_y - geometry.height // 2,
-                )
-
-        if len(branch_paths) > 1:
-            for index, node_id in enumerate(branch_paths[1], start=1):
-                geometry = bounds[node_id]
-                center_y = -index * vertical_step_nm
-                place(
-                    node_id,
-                    column_center_x - geometry.width // 2,
-                    center_y - geometry.height // 2,
-                )
-
-        cursor_x += horizontal_step_nm
-
-    # Defensive fallback for malformed path data: no resolved symbol is lost.
-    for node_id in available:
-        if node_id in origins:
+    for path in graph.main_paths:
+        new_nodes = [node_id for node_id in path.ordered_nodes if node_id in allowed and node_id not in origins]
+        if not new_nodes:
             continue
-        geometry = bounds[node_id]
-        place(node_id, cursor_x - geometry.width // 2, -(geometry.height // 2))
-        cursor_x += horizontal_step_nm
+        y = 0 if not boxes else max(box[3] for box in boxes.values()) + step_y + max(bounds[n].height for n in new_nodes) // 2
+        place_row(list(path.ordered_nodes), y)
 
-    min_left = min(value[0] for value in placed_boxes.values())
-    min_top = min(value[1] for value in placed_boxes.values())
-    max_right = max(value[2] for value in placed_boxes.values())
-    max_bottom = max(value[3] for value in placed_boxes.values())
-    shift_x = origin_x_nm - min_left
-    shift_y = origin_y_nm - min_top
-    normalized = {
-        node_id: (origin[0] + shift_x, origin[1] + shift_y)
-        for node_id, origin in origins.items()
-    }
-    return OriginLayout(
-        positions=normalized,
-        width_nm=max_right - min_left,
-        height_nm=max_bottom - min_top,
-        origin_x_nm=origin_x_nm,
-        origin_y_nm=origin_y_nm,
-    )
+    branch_counts: dict[str, int] = {}
+    pending = list(graph.branches)
+    while pending:
+        next_pending = []
+        progressed = False
+        for path in pending:
+            unplaced = [node_id for node_id in path.ordered_nodes if node_id in allowed and node_id not in origins]
+            if not unplaced:
+                continue
+            anchor = next((node_id for node_id in path.anchor_node_ids if node_id in origins), None)
+            if anchor is None:
+                anchor = next((node_id for node_id in path.ordered_nodes if node_id in origins), None)
+            if anchor is None:
+                next_pending.append(path)
+                continue
+            count = branch_counts.get(anchor, 0)
+            branch_counts[anchor] = count + 1
+            sign = 1 if count % 2 == 0 else -1
+            ax, ay = center(anchor)
+            # First siblings retain the familiar down/up placement; additional
+            # siblings get a separate column rather than joining the main row.
+            bx = ax + (count // 2) * step_x
+            previous = anchor
+            for node_id in _nodes_from_anchor(path, anchor):
+                if node_id not in allowed or node_id in origins:
+                    continue
+                py = center(previous)[1]
+                desired_y = py + sign * step_y
+                place(node_id, bx, desired_y, axis=1, sign=sign)
+                previous = node_id
+            progressed = True
+        if not next_pending:
+            break
+        if not progressed:
+            # Disconnected paths get a separate row.  After one such path is
+            # placed, dependent nested paths can resolve their shared anchor.
+            path = next_pending.pop(0)
+            nodes = [n for n in path.ordered_nodes if n in allowed and n not in origins]
+            if nodes:
+                y = max((box[3] for box in boxes.values()), default=0) + step_y + max(bounds[n].height for n in nodes) // 2
+                place_row(nodes, y)
+        pending = next_pending
+
+    remaining = [node_id for node_id in placement_order(graph) if node_id in allowed and node_id not in origins]
+    remaining.extend(n for n in available if n not in origins and n not in remaining)
+    if remaining:
+        y = max((box[3] for box in boxes.values()), default=-step_y) + step_y + max(bounds[n].height for n in remaining) // 2
+        place_row(remaining, y)
+
+    min_left = min(box[0] for box in boxes.values())
+    min_top = min(box[1] for box in boxes.values())
+    # Translate by whole grid multiples, preserving each pin origin's grid.
+    shift_x = shift_on_grid(origin_x_nm - min_left, grid_x)
+    shift_y = shift_on_grid(origin_y_nm - min_top, grid_y)
+    normalized = {n: (x + shift_x, y + shift_y) for n, (x, y) in origins.items()}
+    left, top = min_left + shift_x, min_top + shift_y
+    right = max(box[2] for box in boxes.values()) + shift_x
+    bottom = max(box[3] for box in boxes.values()) + shift_y
+    if page_bounds is not None:
+        pl, pt, pr, pb = page_bounds
+        if left < pl or top < pt or right > pr or bottom > pb:
+            raise ValueError("LAYOUT_PAGE_OVERFLOW: symbol layout exceeds the supplied paper bounds")
+    return OriginLayout(normalized, right - left, bottom - top, left, top)
+
 
 
 def layout_symbols_sequentially(

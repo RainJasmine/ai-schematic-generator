@@ -1,0 +1,16 @@
+// 0.2.4 最小宿主扩展：在当前客户端 BeginCommit 中清空指定图页。
+// 命令尚需宿主 C++ 实现并注册；有完整 GetItems/DeleteItems 的宿主可走回退。
+syntax = "proto3";
+package kiapi.schematic.commands;
+import "common/types/base_types.proto";
+
+message ClearSchematicPage {
+  kiapi.common.types.DocumentSpecifier document = 1;
+  string request_id = 2;
+}
+
+message ClearSchematicPageResponse {
+  bool success = 1;
+  uint32 deleted_count = 2;
+  string message = 3;
+}

@@ -1,7 +1,7 @@
 {
   "$schema": "https://go.kicad.org/api/schemas/v1",
-  "identifier": "com.sunveda.kicad-ai-schematic-generator",
-  "name": "AI Schematic Generator",
+  "identifier": "org.rfeda.ai-schematic-generator",
+  "name": "RF EDA AI Schematic Assistant",
   "description": "Create a schematic from Word, text or Graph IR, then revise it with AI",
   "runtime": {
     "type": "python",
@@ -10,7 +10,7 @@
   "actions": [
     {
       "identifier": "generate-schematic",
-      "name": "AI schematic design assistant",
+      "name": "RF EDA AI schematic assistant",
       "description": "Create a schematic from Word, text or Graph IR, then discuss revisions",
       "show-button": true,
       "scopes": ["schematic"],

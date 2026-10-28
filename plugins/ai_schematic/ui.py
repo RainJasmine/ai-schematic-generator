@@ -1,999 +1,700 @@
-"""Choose a Word or Graph IR JSON file and generate in KiCad."""
-
+"""RF EDA 原生客户端；控件只在主线程更新，HTTP/IPC 由工作线程执行。"""
 from __future__ import annotations
-
-from pathlib import Path
+import hashlib
 from html import escape
 import json
-import os
-import uuid
-from urllib.error import URLError
-
-from PySide6.QtCore import QObject, QSettings, QThread, Signal, Slot
-from PySide6.QtWidgets import (
-    QFileDialog,
-    QDialog,
-    QGridLayout,
-    QGroupBox,
-    QHBoxLayout,
-    QInputDialog,
-    QLabel,
-    QLineEdit,
-    QMainWindow,
-    QMessageBox,
-    QPlainTextEdit,
-    QPushButton,
-    QProgressBar,
-    QTabWidget,
-    QTextBrowser,
-    QVBoxLayout,
-    QWidget,
-)
-
-from .generator import GenerationReport, generate
-from .generator import verify_managed_placement
-from .ai_service import (DEFAULT_URL, download_graph, download_html_report,
-                         get_capabilities,
-                         get_requirements, get_revision_result, get_revision_state,
-                         submit_revision, submit_text_job, submit_word_job,
-                         wait_for_job)
-from .graph_ir import GraphIR
-from .session import SessionStore
+from pathlib import Path
+import threading
+from PySide6.QtCore import QSettings, QThread, QUrl, Signal, Slot
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import (QFileDialog, QGridLayout, QInputDialog, QMainWindow,
+    QMessageBox, QPushButton)
+from .ai_service import AiServiceError, ServiceClient, WaitingStopped
+from .session_store import SessionStore
+from .workflow import ClientWorkflow
 
 
-class GenerationWorker(QObject):
-    progress = Signal(str)
-    job_state = Signal(object)
-    completed = Signal(object)
-    failed = Signal(object)
+class ClientTask(QThread):
+    message = Signal(str)
+    update = Signal(object)
 
-    def __init__(self, mode: str, path: str, endpoint: str, token: str = "",
-                 instruction: str = "", run_name: str = "", resume_url: str = "",
-                 request_id: str = "", current_job: dict | None = None,
-                 placement: dict | None = None, continuation_job_id: str = "") -> None:
-        super().__init__()
-        self._mode = mode
-        self._path = path
-        self._endpoint = endpoint
-        self._token = token
-        self._instruction = instruction
-        self._run_name = run_name
-        self._resume_url = resume_url
-        self._request_id = request_id
-        self._current_job = current_job or {}
-        self._placement = placement or {}
-        self._continuation_job_id = continuation_job_id
-        self._post_started = False
-        self._accepted = False
+    def __init__(self, function, parent=None):
+        super().__init__(parent)
+        self.function, self.stop_event = function, threading.Event()
+        self.value, self.error = None, None
 
-    @Slot()
-    def run(self) -> None:
+    def run(self):
         try:
-            if self._mode == "json":
-                self.progress.emit("正在读取本地 Graph IR JSON…")
-                graph = GraphIR.load(self._path)
-                self.completed.emit({"job": None,
-                                     "report": generate(graph, self.progress.emit,
-                                                        replace=self._placement or None,
-                                                        require_complete=True),
-                                     "diagnostic": None})
-                return
-            if self._resume_url:
-                self.progress.emit("正在继续查询已有 AI 任务…")
-                job = wait_for_job(self._endpoint, self._resume_url,
-                                   token=self._token, on_progress=self.job_state.emit)
-            elif self._mode == "revision":
-                self.progress.emit("正在核对当前图纸和服务器版本…")
-                base_job_id = self._current_job["job_id"]
-                baseline = get_revision_state(self._endpoint, base_job_id, token=self._token)
-                if baseline.get("pending_job_id"):
-                    raise ValueError(f"已有反馈任务正在运行：{baseline['pending_job_id']}，请先接续该任务")
-                if baseline.get("head_job_id") != base_job_id:
-                    raise ValueError(f"服务器已有新版 {baseline.get('head_job_id')}，请先接续新版")
-                selection = verify_managed_placement(self._placement)
-                self._post_started = True
-                accepted = submit_revision(
-                    self._endpoint, base_job_id, self._instruction,
-                    int(baseline["revision"]), baseline["graph_hash"],
-                    token=self._token, request_id=self._request_id,
-                    selection=selection, continuation_job_id=self._continuation_job_id)
-                self._accepted = True
-                self.job_state.emit(accepted)
-                job = wait_for_job(self._endpoint, accepted["status_url"],
-                                   token=self._token, on_progress=self.job_state.emit)
-            else:
-                self.progress.emit("正在提交设计任务…")
-                if self._placement:
-                    verify_managed_placement(self._placement)
-                if self._mode == "word":
-                    self._post_started = True
-                    accepted = submit_word_job(
-                        self._path, self._endpoint, token=self._token,
-                        user_text=self._instruction, run_name=self._run_name,
-                        request_id=self._request_id)
-                else:
-                    self._post_started = True
-                    accepted = submit_text_job(
-                        self._instruction, self._endpoint, token=self._token,
-                        run_name=self._run_name, request_id=self._request_id)
-                self._accepted = True
-                self.job_state.emit(accepted)
-                job = wait_for_job(self._endpoint, accepted["status_url"],
-                                   token=self._token, on_progress=self.job_state.emit)
-            diagnostic = None
-            if job.get("revision_result_url"):
-                try:
-                    diagnostic = get_revision_result(
-                        self._endpoint, job["revision_result_url"], token=self._token)
-                except Exception as exc:
-                    self.progress.emit(f"反馈诊断暂不可读取：{exc}")
-            if self._mode == "inspect":
-                self.completed.emit({"job": job, "report": None,
-                                     "diagnostic": diagnostic, "inspect": True})
-                return
-            if job.get("status") != "succeeded":
-                self.completed.emit({"job": job, "report": None,
-                                     "diagnostic": diagnostic})
-                return
-            if (self._resume_url and self._current_job.get("job_id") == job.get("job_id")
-                    and self._placement):
-                verify_managed_placement(self._placement)
-                self.completed.emit({"job": job, "report": None,
-                                     "diagnostic": diagnostic})
-                return
-            graph = GraphIR.parse(download_graph(self._endpoint, job["result_url"],
-                                                 token=self._token))
-            self.progress.emit(f"已载入：{graph.summary()}")
-            for warning in graph.warnings:
-                self.progress.emit(f"警告：{warning}")
-            replacement = self._placement or None
-            report = generate(graph, self.progress.emit, replace=replacement,
-                              require_complete=True)
-            self.completed.emit({"job": job, "report": report,
-                                 "diagnostic": diagnostic})
-        except Exception as exc:  # noqa: BLE001 - errors are presented in the UI
-            self.failed.emit({"message": str(exc),
-                              "keep_pending": self._post_started and not self._accepted
-                              and isinstance(exc.__cause__, (URLError, TimeoutError, OSError))})
-
-
-class ReportDownloadWorker(QObject):
-    completed = Signal(str)
-    failed = Signal(str)
-
-    def __init__(self, service_url: str, report_url: str, destination: str,
-                 token: str) -> None:
-        super().__init__()
-        self._service_url = service_url
-        self._report_url = report_url
-        self._destination = destination
-        self._token = token
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            path = download_html_report(self._service_url, self._report_url,
-                                        self._destination, token=self._token)
-            self.completed.emit(str(path))
-        except Exception as exc:  # noqa: BLE001 - errors are presented in the UI
-            self.failed.emit(str(exc))
-
-
-class ConnectionWorker(QObject):
-    completed = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, endpoint: str, token: str) -> None:
-        super().__init__()
-        self._endpoint = endpoint
-        self._token = token
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            self.completed.emit(get_capabilities(self._endpoint, token=self._token))
-        except Exception as exc:  # noqa: BLE001 - shown in UI
-            self.failed.emit(str(exc))
-
-
-class RequirementsWorker(QObject):
-    completed = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, endpoint: str, requirements_url: str, token: str) -> None:
-        super().__init__()
-        self._endpoint = endpoint
-        self._requirements_url = requirements_url
-        self._token = token
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            self.completed.emit(get_requirements(self._endpoint, self._requirements_url,
-                                                 token=self._token))
-        except Exception as exc:  # noqa: BLE001 - shown in UI
-            self.failed.emit(str(exc))
+            self.value = self.function(self)
+        except Exception as exc:
+            self.error = exc
 
 
 class GeneratorWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, *, store=None):
         super().__init__()
-        self.setWindowTitle("AI 原理图设计助手")
-        self.resize(940, 680)
-        self._input_kind = "text"
-        self._thread: QThread | None = None
-        self._worker: GenerationWorker | None = None
-        self._report_thread: QThread | None = None
-        self._report_worker: ReportDownloadWorker | None = None
-        self._connection_thread: QThread | None = None
-        self._connection_worker: ConnectionWorker | None = None
-        self._requirements_thread: QThread | None = None
-        self._requirements_worker: RequirementsWorker | None = None
-        self._settings = QSettings("SunvEDA", "AI Schematic Generator")
-        self._store = SessionStore()
+        self.setWindowTitle("RF EDA · AI 设计助手")
+        self.settings = QSettings("RFEDA", "SchematicAssistant")
+        self.store, self.workflow = store or SessionStore(), None
+        self.task, self.after_task = None, None
+        self.sequences, self.buttons = {}, {}
+        self.close_when_idle, self.mutating = False, False
+        self.persistence_error = ""
+        self.credential_origin = ""
+        from .ui_workspace import build_workspace
+        build_workspace(self)
+        self.endpoint.editingFinished.connect(self.switch_service)
+        self.user_text.textChanged.connect(self.save_drafts)
+        self.feedback.textChanged.connect(self.save_drafts)
+        self.run_name.textChanged.connect(self.save_drafts)
+        self.choices.activated.connect(self.choose_suggestion)
+        self.switch_service(initial=True)
+
+    def button(self, key, label, callback):
+        b = QPushButton(label)
+        b.clicked.connect(lambda checked=False: self.invoke(callback))
+        self.buttons[key] = b
+        return b
+
+    def invoke(self, callback):
         try:
-            self._state = self._store.load()
-        except (OSError, ValueError, json.JSONDecodeError):
-            self._state = {}
-        self._state.setdefault("current_job", None)
-        self._state.setdefault("last_job", None)
-        self._state.setdefault("placement", None)
-        self._state.setdefault("pending", None)
-        self._state.setdefault("continuation_job_id", "")
-        self._state.setdefault("history", [])
-        self._state.setdefault("conversation", [])
-        self._state.setdefault("current_service_url", self._state.get("service_url", ""))
-        self._state.setdefault("last_service_url", self._state.get("service_url", ""))
-        self._job_id = ""
-        self._report_url = (self._state.get("last_job") or {}).get("report_url") or self._settings.value("report_url", "")
-        self._last_sequence = 0
-        self._last_progress_message = ""
-        self._announced_success = False
+            callback()
+        except (AiServiceError, OSError, ValueError) as exc:
+            if getattr(exc, "code", "").startswith("SESSION_"):
+                self.persistence_error = str(exc)
+                self.render_busy()
+            self.status.setText("本次操作未完成：" + str(exc))
+            QMessageBox.warning(self, "操作未完成", str(exc))
 
-        central = QWidget(self)
-        root = QVBoxLayout(central)
-        self.tabs = QTabWidget()
-        root.addWidget(self.tabs, 1)
+    def add_buttons(self, layout, items):
+        row = QGridLayout()
+        for index, (key, label, callback) in enumerate(items):
+            row.addWidget(self.button(key, label, callback), index // 2, index % 2)
+        layout.addLayout(row)
 
-        design_page = QWidget()
-        design_layout = QVBoxLayout(design_page)
-        heading = QHBoxLayout()
-        title = QLabel("设计助手")
-        title.setStyleSheet("font-size: 18px; font-weight: 600")
-        heading.addWidget(title)
-        heading.addStretch(1)
-        self.current_label = QLabel("当前图：尚未生成")
-        self.current_label.setWordWrap(True)
-        heading.addWidget(self.current_label)
-        design_layout.addLayout(heading)
+    def project_setting(self, service):
+        return "project-" + hashlib.sha256(service.encode()).hexdigest()[:24]
 
-        self.conversation_view = QTextBrowser()
-        self.conversation_view.setOpenExternalLinks(False)
-        design_layout.addWidget(self.conversation_view, 1)
-        self.composer_group = QGroupBox("开始设计")
-        composer = QVBoxLayout(self.composer_group)
-        self.composer_hint = QLabel("输入设计要求，也可以附加 Word 技术协议。")
-        self.composer_hint.setWordWrap(True)
-        composer.addWidget(self.composer_hint)
-        self.user_text_edit = QPlainTextEdit()
-        self.user_text_edit.setPlaceholderText("描述链路结构、技术指标或需要 AI 回答的问题…")
-        self.user_text_edit.setMaximumHeight(110)
-        composer.addWidget(self.user_text_edit)
-        attachment = QHBoxLayout()
-        self.path_edit = QLineEdit()
-        self.path_edit.setReadOnly(True)
-        self.path_edit.setPlaceholderText("未附加 Word；可直接发送纯文字")
-        self.word_button = QPushButton("附加 Word…")
-        self.text_button = QPushButton("移除附件")
-        self.json_button = QPushButton("导入本地 JSON…")
-        attachment.addWidget(self.path_edit, 1)
-        attachment.addWidget(self.word_button)
-        attachment.addWidget(self.text_button)
-        attachment.addWidget(self.json_button)
-        composer.addLayout(attachment)
-        self.summary_label = QLabel("纯文字设计")
-        self.summary_label.setWordWrap(True)
-        composer.addWidget(self.summary_label)
-        send_row = QHBoxLayout()
-        self.run_name_edit = QLineEdit()
-        self.run_name_edit.setPlaceholderText("可选任务名称")
-        send_row.addWidget(self.run_name_edit, 1)
-        self.generate_button = QPushButton("开始设计")
-        self.generate_button.setEnabled(False)
-        send_row.addWidget(self.generate_button)
-        composer.addLayout(send_row)
-        design_layout.addWidget(self.composer_group)
-        navigation = QHBoxLayout()
-        self.new_design_button = QPushButton("新建设计")
-        self.new_target_button = QPushButton("新反馈目标")
-        navigation.addWidget(self.new_design_button)
-        navigation.addWidget(self.new_target_button)
-        navigation.addStretch(1)
-        design_layout.addLayout(navigation)
-        self.tabs.addTab(design_page, "设计助手")
+    def switch_service(self, initial=False):
+        if self.task:
+            return False
+        try:
+            origin = ServiceClient(self.endpoint.text().strip()).service_url
+            if self.credential_origin and self.credential_origin != origin:
+                self.token.clear()
+            self.credential_origin = origin
+            client = ServiceClient(origin, token=self.token.text().strip())
+        except (ValueError, AiServiceError) as exc:
+            self.status.setText(str(exc))
+            self.render_busy()
+            return False
+        if self.workflow and self.workflow.service == client.service_url:
+            self.workflow.client = client
+            return not self.persistence_error
+        project = str(self.settings.value(self.project_setting(client.service_url), ""))
+        try:
+            workflow = ClientWorkflow(client, self.store, project_id=project)
+        except (AiServiceError, ValueError, OSError) as exc:
+            self.workflow = None
+            self.persistence_error = str(exc)
+            self.status.setText("会话未能读取，已阻止提交：" + str(exc))
+            self.render_busy()
+            return False
+        self.workflow = workflow
+        self.persistence_error = ""
+        self.settings.setValue("service_url", client.service_url)
+        self.render(restore_draft=True)
+        return True
 
-        tasks_page = QWidget()
-        tasks_layout = QVBoxLayout(tasks_page)
-        self.last_label = QLabel("最近任务：尚未提交")
-        self.last_label.setWordWrap(True)
-        tasks_layout.addWidget(self.last_label)
-        self.status_label = QLabel("状态：尚未提交任务")
-        self.status_label.setWordWrap(True)
-        tasks_layout.addWidget(self.status_label)
-        self.progress = QProgressBar()
+    def launch(self, function, message, after=None, *, require_session=True):
+        if self.task:
+            return
+        if require_session and not self.switch_service():
+            return
+        if require_session and not self.workflow:
+            return
+        self.status.setText(message)
+        self.activity_toggle.setChecked(True)
+        self.log.appendPlainText(message)
+        self.progress.setRange(0, 0)
+        self.progress.setFormat("执行中")
+        self.task, self.after_task = ClientTask(function, self), after
+        self.task.message.connect(self.log.appendPlainText)
+        self.task.update.connect(self.on_update)
+        self.task.finished.connect(self.task_finished)
+        if self.workflow:
+            self.workflow.event, self.workflow.log = self.task.update.emit, self.task.message.emit
+        self.render_busy()
+        self.refresh_summary()
+        self.task.start()
+
+    @Slot()
+    def task_finished(self):
+        task, after = self.task, self.after_task
+        self.task, self.after_task, self.mutating = None, None, False
+        if self.workflow:
+            self.workflow.event, self.workflow.log = lambda v: None, lambda v: None
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
-        tasks_layout.addWidget(self.progress)
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setPlaceholderText("任务事件、符号匹配和导入结果显示在这里")
-        tasks_layout.addWidget(self.log, 1)
-        task_actions = QHBoxLayout()
-        self.resume_button = QPushButton("继续上次任务")
-        self.report_button = QPushButton("本轮 HTML 报告")
-        self.current_report_button = QPushButton("当前图报告")
-        self.requirements_button = QPushButton("当前需求")
-        self.history_button = QPushButton("版本记录")
-        for button in (self.resume_button, self.report_button,
-                       self.current_report_button, self.requirements_button,
-                       self.history_button):
-            task_actions.addWidget(button)
-        tasks_layout.addLayout(task_actions)
-        self.tabs.addTab(tasks_page, "任务与版本")
+        self.progress.setFormat("操作已结束")
+        if isinstance(task.error, WaitingStopped):
+            self.status.setText("已停止客户端等待，后端继续；可恢复查询")
+            self.progress.setFormat("等待已停止")
+        elif task.error:
+            if getattr(task.error, "uncertain", False) and self.workflow:
+                try:
+                    self.workflow.save(uncertain=True)
+                except (AiServiceError, OSError, ValueError) as exc:
+                    self.persistence_error = str(exc)
+            if getattr(task.error, "code", "") in ("SESSION_CONFLICT", "SESSION_INVALID"):
+                self.persistence_error = str(task.error)
+            self.status.setText("本次操作未完成；任务记录已保留，请查看日志")
+            self.progress.setFormat("未完成")
+            self.log.appendPlainText(str(task.error))
+            if not self.close_when_idle:
+                QMessageBox.warning(self, "操作未完成", str(task.error))
+        elif isinstance(task.value, dict) and task.value.get("delivered"):
+            self.progress.setValue(1)
+            self.progress.setFormat("已完整导入")
+            self.status.setText("原理图已更新")
+            self.append_conversation("assistant", "原理图已更新。后续生成的结果仍需点击更新按钮应用。")
+        elif isinstance(task.value, dict) and task.value.get("ready"):
+            self.status.setText("设计结果已生成；点击“更新原理图”应用")
+            self.progress.setFormat("结果已生成，尚未应用")
+            self.append_conversation("assistant", "设计结果已生成。可查看设计指标要求、报告或继续反馈；点击“更新原理图”后才会写入画布。")
+        elif isinstance(task.value, dict) and task.value.get("adopted"):
+            self.status.setText("旧版图已完成只读核验和会话恢复；未重新运行 AI、未重画图")
+            head = task.value.get("head_job_id")
+            current_id = self.workflow.state.get("success", {}).get("job", {}).get("job_id")
+            if head and head != current_id:
+                self.log.appendPlainText("当前画布是历史成功图。服务端最新任务：" + head + "；可使用“按任务 ID 恢复”核验并更新。")
+        self.render()
+        self.render_busy()
+        if task.error is None:
+            self.show_terminal(task.value)
+            if after:
+                self.invoke(lambda: after(task.value))
+        self.refresh_summary()
+        task.deleteLater()
+        if self.close_when_idle:
+            self.close()
 
-        connection_page = QWidget()
-        connection_layout = QVBoxLayout(connection_page)
-        file_group = QGroupBox("AI 服务连接")
-        file_layout = QGridLayout(file_group)
-        self.endpoint_edit = QLineEdit(os.environ.get("KICAD_AI_SERVICE_URL")
-                                       or os.environ.get("KICAD_AI_GENERATE_URL")
-                                       or self._state.get("service_url")
-                                       or self._settings.value("service_url", DEFAULT_URL))
-        self.endpoint_edit.setToolTip("AI 服务根地址；插件会提交到 /api/v1/jobs")
-        self.connection_button = QPushButton("检测连接")
-        self.token_edit = QLineEdit(os.environ.get("AI_EDA_API_KEY", ""))
-        self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.token_edit.setPlaceholderText("可选服务访问令牌")
-        file_layout.addWidget(QLabel("服务："), 0, 0)
-        file_layout.addWidget(self.endpoint_edit, 0, 1, 1, 2)
-        file_layout.addWidget(self.connection_button, 0, 3)
-        file_layout.addWidget(QLabel("令牌："), 1, 0)
-        file_layout.addWidget(self.token_edit, 1, 1, 1, 3)
-        connection_layout.addWidget(file_group)
-        connection_layout.addWidget(QLabel("服务地址和令牌用于上传、轮询及下载。令牌不会写入本地会话文件。"))
-        connection_layout.addStretch(1)
-        self.tabs.addTab(connection_page, "服务连接")
-
-        footer = QHBoxLayout()
-        self.clear_button = QPushButton("清空日志")
-        self.close_button = QPushButton("关闭")
-        footer.addStretch(1)
-        footer.addWidget(self.clear_button)
-        footer.addWidget(self.close_button)
-        root.addLayout(footer)
-
-        self.setCentralWidget(central)
-        self.word_button.clicked.connect(self.choose_word)
-        self.connection_button.clicked.connect(self.check_connection)
-        self.text_button.clicked.connect(self.choose_text)
-        self.json_button.clicked.connect(self.choose_json)
-        self.generate_button.clicked.connect(self.start_generation)
-        self.resume_button.clicked.connect(self.resume_generation)
-        self.report_button.clicked.connect(self.start_report_download)
-        self.current_report_button.clicked.connect(self.start_current_report_download)
-        self.new_design_button.clicked.connect(self.start_new_design)
-        self.new_target_button.clicked.connect(self.clear_feedback_target)
-        self.requirements_button.clicked.connect(self.show_current_requirements)
-        self.history_button.clicked.connect(self.show_history)
-        self.clear_button.clicked.connect(self.log.clear)
-        self.close_button.clicked.connect(self.close)
-        self.user_text_edit.textChanged.connect(self._update_controls)
-        self._render_conversation()
-        self._update_controls()
-
-    @Slot()
-    def choose_word(self) -> None:
-        if self._state.get("current_job") and not self._state.get("new_design"):
-            self.start_new_design()
-            if not self._state.get("new_design"):
-                return
-        filename, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择 Word 文档",
-            str(Path.home()),
-            "Word files (*.docx);;All files (*)",
-        )
-        if not filename:
+    def render_busy(self):
+        busy = bool(self.task)
+        for key, button in self.buttons.items():
+            button.setEnabled(not busy or key in ("clear", "close"))
+        self.buttons["stop"].setEnabled(busy and not self.mutating)
+        self.endpoint.setEnabled(not busy)
+        self.token.setEnabled(not busy)
+        if busy:
             return
-        self._select_file(filename, "word")
-
-    @Slot()
-    def choose_json(self) -> None:
-        filename, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择 Graph IR JSON",
-            str(Path.home()),
-            "JSON files (*.json);;All files (*)",
-        )
-        if filename:
-            self._select_file(filename, "json")
-
-    @Slot()
-    def choose_text(self) -> None:
-        self._input_kind = "text"
-        self.path_edit.clear()
-        self.summary_label.setText("未附加文件；将发送纯文字")
-        self.user_text_edit.setFocus()
-        self._update_controls()
-
-    @Slot()
-    def check_connection(self) -> None:
-        if self._connection_thread is not None or self._thread is not None:
+        if self.workflow is None or self.persistence_error:
+            for key, button in self.buttons.items():
+                button.setEnabled(key in ("close", "clear", "reload", "bind"))
             return
-        thread = QThread(self)
-        worker = ConnectionWorker(self.endpoint_edit.text().strip(),
-                                  self.token_edit.text().strip())
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.completed.connect(self.connection_checked)
-        worker.failed.connect(self.connection_failed)
-        worker.completed.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
-        worker.completed.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(self._connection_finished)
-        thread.finished.connect(thread.deleteLater)
-        self._connection_thread = thread
-        self._connection_worker = worker
-        self._set_busy(False)
-        thread.start()
+        state = self.workflow.state
+        success = state.get("success") or {}
+        operation = state.get("operation") or {}
+        job = operation.get("job") or {}
+        running = job.get("status") in ("queued", "running")
+        pending = bool(state.get("pending"))
+        idle = not pending and not running
+        mismatch = job.get("status") == "succeeded" and job.get("job_id") != success.get("job", {}).get("job_id")
+        feedback_ready = bool(success and idle and not state.get("new_design") and not mismatch)
+        feedback = self.feedback.toPlainText().strip()
+        self.buttons["feedback"].setEnabled(feedback_ready and not state.get("ended") and 0 < len(feedback) <= 12000)
+        self.buttons["feedback"].setToolTip("仅依据后端设计版本，不读取或上传画布中的人工修改")
+        for key in ("new_feedback", "composer_new_feedback"):
+            self.buttons[key].setEnabled(feedback_ready)
+        self.buttons["finish"].setEnabled(bool((success or state.get("local_graph")) and idle))
+        text = self.user_text.toPlainText().strip()
+        self.buttons["start"].setEnabled(bool(idle and (not success or state.get("new_design")) and (self.path.text() or text) and len(text) <= 20000))
+        self.buttons["new"].setEnabled(idle)
+        self.buttons["json"].setEnabled(idle)
+        self.buttons["apply"].setEnabled(bool(idle and not state.get("uncertain") and (success.get("graph") or state.get("local_graph"))))
+        self.buttons["remove_file"].setEnabled(bool(self.path.text()))
+        self.buttons["clear_records"].setEnabled(idle and not state.get("uncertain"))
+        self.buttons["operation_report"].setEnabled(bool(job.get("report_url")))
+        self.buttons["current_report"].setEnabled(bool(success.get("job", {}).get("report_url")))
+        self.buttons["requirements"].setEnabled(bool(success))
+        self.buttons["export"].setEnabled(bool(success or operation.get("candidate_graph") or state.get("local_graph")))
+        self.buttons["verify"].setEnabled(bool(state.get("uncertain")))
+        self.buttons["resume_id"].setEnabled(not pending)
+        self.composer_changed()
+
+    def render(self, restore_draft=False):
+        if self.workflow is None:
+            return
+        state = self.workflow.state
+        target = state.get("target") or {}
+        if target:
+            self.settings.setValue(self.project_setting(self.workflow.service), self.workflow.project_id)
+            self.target_label.setText("上次绘图目标：" + str(target.get("screen") or target.get("screen_filename") or target["key"]))
+        else:
+            self.target_label.setText("生成后点击“更新原理图”应用到当前图页")
+        if state.get("uncertain"):
+            self.target_label.setText("上次绘图结果待确认；AI 反馈仍可继续，禁止重复写图")
+        if restore_draft:
+            self.choices.clear()
+            self.selection_label.setText("反馈只依据后端版本；人工改图不参与，下次更新将清空旧图。")
+            for widget, key in ((self.user_text, "user_text"), (self.feedback, "feedback")):
+                widget.blockSignals(True)
+                widget.setPlainText((state.get("draft") or {}).get(key, ""))
+                widget.blockSignals(False)
+            self.run_name.blockSignals(True)
+            self.run_name.setText((state.get("draft") or {}).get("run_name", ""))
+            self.run_name.blockSignals(False)
+        self.render_conversation()
+        self.input_mode.setCurrentIndex(1 if state.get("success") and not state.get("new_design") else 0)
+        self.composer_changed()
+        self.refresh_summary()
+        if not self.task:
+            self.render_busy()
+
+    def save_drafts(self):
+        if self.workflow:
+            try:
+                self.workflow.save(draft={"user_text": self.user_text.toPlainText(), "feedback": self.feedback.toPlainText(), "run_name": self.run_name.text()})
+            except (AiServiceError, ValueError, OSError) as exc:
+                self.persistence_error = str(exc)
+                self.status.setText("草稿未能保存，暂停新提交；请重读会话：" + str(exc))
+        self.refresh_summary()
+        if not self.task:
+            self.render_busy()
 
     @Slot(object)
-    def connection_checked(self, capabilities: dict) -> None:
-        mode = capabilities.get("execution_mode", "未知")
-        limit = capabilities.get("max_upload_bytes")
-        summary = (f"服务已连接：API {capabilities.get('api_version', '未知')}，"
-                   f"Graph IR {capabilities.get('graph_schema', '未知')}，模式 {mode}")
-        if isinstance(limit, int):
-            summary += f"，Word 上限 {limit // 1048576} MiB"
-        self.log.appendPlainText(summary)
-        if mode == "offline_fixture":
-            self.log.appendPlainText("当前为隔离测试模式，不代表真实 AI 设计已通过。")
-        self.status_label.setText(summary)
+    def on_update(self, event):
+        if event.get("type") == "target":
+            self.render()
+            self.save_drafts()
+            return
+        if event.get("type") == "mutation":
+            self.mutating = True
+            self.buttons["stop"].setEnabled(False)
+            self.status.setText("正在事务内清空并更新图页，请等待完成")
+            return
+        job = event.get("job") or {}
+        p = job.get("progress") or {}
+        details = [job.get("status"), p.get("stage_label") or job.get("stage"), p.get("message")]
+        for key, label in (("elapsed_seconds", "执行"), ("stage_elapsed_seconds", "阶段"),
+            ("activity_elapsed_seconds", "当前等待"), ("queue_seconds", "排队"), ("heartbeat_age_seconds", "心跳距今")):
+            if isinstance(p.get(key), (int, float)):
+                details.append(f"{label} {int(p[key])} 秒")
+        if job.get("status") == "queued" and isinstance(p.get("queue_position"), int):
+            details.append(f"前方等待 {max(0, p['queue_position'] - 1)} 项")
+        self.status.setText(" | ".join(str(v) for v in details if v))
+        self.status.setToolTip(self.status.text())
+        identifier = job.get("job_id", "")
+        last = self.sequences.get(identifier, 0)
+        first = p.get("first_event_sequence", 0)
+        if isinstance(first, int) and first > last + 1:
+            self.log.appendPlainText("较早事件已超出服务保留窗口")
+        for item in p.get("events") or []:
+            if isinstance(item, dict) and isinstance(item.get("sequence"), int) and item["sequence"] > last:
+                self.log.appendPlainText(f"{item.get('at', '')} {item.get('message', '')}")
+                last = item["sequence"]
+        self.sequences[identifier] = last
+        self.stage_detail.setText(str(p.get("stage_label") or job.get("stage") or "等待服务事件"))
+        self.refresh_summary()
 
-    @Slot(str)
-    def connection_failed(self, message: str) -> None:
-        self.log.appendPlainText(f"连接检测失败：{message}")
-        QMessageBox.warning(self, "连接检测失败", message)
+    def choose_file(self, kind="word"):
+        if kind == "json":
+            return self.import_local_graph()
+        path, _ = QFileDialog.getOpenFileName(self, "选择技术协议", str(Path.home()), "Word (*.docx)")
+        if path:
+            self.path.setText(path)
+            self.path.setToolTip(path)
+            self.render_busy()
+            self.refresh_summary()
 
-    @Slot()
-    def _connection_finished(self) -> None:
-        self._connection_thread = None
-        self._connection_worker = None
-        self._update_controls()
+    def remove_file(self):
+        self.path.clear()
+        self.path.setToolTip("")
+        self.refresh_summary()
 
-    def _select_file(self, filename: str, kind: str) -> None:
-        self._input_kind = kind
-        self.path_edit.setText(filename)
-        self.summary_label.setText(f"{'本地 JSON' if kind == 'json' else 'Word 上传'}：{Path(filename).name}")
-        self._update_controls()
-        self.log.appendPlainText(f"已选择{'本地 JSON' if kind == 'json' else 'Word'}：{filename}")
+    def import_local_graph(self):
+        if not self.switch_service():
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "导入本地 Graph IR（不调用 AI）", str(Path.home()), "Graph IR (*.json)")
+        if path:
+            self.launch(lambda task: self.workflow.create("json", path=path, stop_event=task.stop_event),
+                        "正在解析并缓存本地 Graph IR…")
 
-    def _append_conversation(self, role: str, message: str) -> None:
-        rows = self._state.setdefault("conversation", [])
-        rows.append({"role": role, "message": message[:12000]})
-        del rows[:-100]
-        self._render_conversation()
+    def start_design(self):
+        """一个首轮请求：仅附件、附件加文字、仅文字共享同一入口。"""
+        if not self.switch_service():
+            return
+        path, text, name = self.path.text().strip(), self.user_text.toPlainText().strip(), self.run_name.text().strip()
+        if not path and not text:
+            QMessageBox.information(self, "需要输入", "请选择技术协议，或填写设计要求；也可以同时提供")
+            return
+        if len(text) > 20000:
+            QMessageBox.information(self, "文字过长", "首轮设计要求最多 20,000 字符")
+            return
+        kind = "word" if path else "text"
+        content = ("附件：" + Path(path).name + "\n" if path else "") + (text or "请根据技术协议生成设计")
+        self.append_conversation("user", content)
+        self.launch(lambda task: self.workflow.create(kind, path=path,
+            user_text=text, run_name=name, stop_event=task.stop_event), "正在提交设计…")
 
-    def _render_conversation(self) -> None:
-        rows = self._state.get("conversation") or []
+    def send_message(self):
+        key = "feedback" if self.input_mode.currentData() == "feedback" else "start"
+        if self.buttons[key].isEnabled():
+            self.buttons[key].click()
+
+    def composer_changed(self, *_):
+        feedback = self.input_mode.currentData() == "feedback"
+        self.editor_stack.setCurrentIndex(1 if feedback else 0)
+        self.buttons["start"].setVisible(not feedback)
+        self.buttons["feedback"].setVisible(feedback)
+        self.buttons["word"].setVisible(not feedback)
+        self.attachment_row.setVisible(not feedback and bool(self.path.text()))
+        self.run_name.setVisible(not feedback)
+        self.choices.setVisible(feedback and self.choices.count() > 0)
+        self.selection_label.setVisible(feedback)
+        self.feedback_toolbar.setVisible(feedback)
+        self.input_hint.setText("基于当前成功图修改或咨询" if feedback else "仅 Word / Word＋文字 / 仅文字")
+        text = self.feedback.toPlainText() if feedback else self.user_text.toPlainText()
+        self.char_count.setText(f"{len(text)} / {12000 if feedback else 20000}")
+
+    def navigation_changed(self, index):
+        for i, (button, _, _) in enumerate(self.nav_buttons[:3]):
+            button.setChecked(i == index)
+        self.breadcrumb.setText("RF EDA · AI 设计助手")
+
+    def refresh_summary(self):
+        if not hasattr(self, "version_label"):
+            return
+        state = self.workflow.state if self.workflow else {}
+        success = state.get("success") or {}
+        job = (state.get("operation") or {}).get("job") or {}
+        revision = (success.get("baseline") or {}).get("revision")
+        version = f"v{revision}" if revision else ("已生成" if success else "未生成")
+        applied = state.get("applied_revision")
+        canvas = f"画布 v{applied}" if applied else ("画布有旧绘图记录" if state.get("import") else "画布未更新")
+        self.version_label.setText("后端 " + version + " · " + canvas + (" · 已结束" if state.get("ended") else ""))
+        self.design_heading.setText("继续设计" if success and not state.get("new_design") else "开始设计")
+        kind = "Word＋文字" if self.path.text() and self.user_text.toPlainText().strip() else ("Word 技术协议" if self.path.text() else "文字需求")
+        self.input_summary.setText("输入方式：" + kind)
+        self.service_summary.setText("AI 服务\n" + (self.credential_origin or self.endpoint.text()).removeprefix("http://").removeprefix("https://"))
+        self.task_summary.setText("后端版本：" + version + "\n本轮任务：" + str(job.get("job_id") or "尚未提交") + "\n" + self.status.text())
+        if state.get("uncertain"):
+            self.stage_detail.setText("图纸事务待核验")
+        elif success and job.get("job_id") == success.get("job", {}).get("job_id") and job.get("status") == "succeeded":
+            self.stage_detail.setText("设计结果已生成，画布仅在点击更新时重绘")
+        else:
+            progress = job.get("progress") or {}
+            self.stage_detail.setText(str(progress.get("stage_label") or job.get("stage") or job.get("status") or "尚未开始；以服务实际事件为准"))
+        self.composer_changed()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+
+    def resume(self):
+        if not self.switch_service():
+            return
+        state = self.workflow.state
+        identifier = None
+        if not state.get("pending") and not state.get("operation", {}).get("job"):
+            identifier, ok = QInputDialog.getText(self, "恢复任务", "本服务的 32 位任务 ID")
+            if not ok or not identifier.strip():
+                return
+            identifier = identifier.strip()
+        self.launch(lambda task: self.workflow.resume(identifier, stop_event=task.stop_event), "正在恢复原任务…")
+
+    def submit_feedback(self):
+        if not self.switch_service():
+            return
+        text = self.feedback.toPlainText()
+        self.append_conversation("user", text)
+        self.launch(lambda task: self.workflow.revise(text, stop_event=task.stop_event), "正在基于后端设计版本提交反馈…")
+
+    def resume_by_id(self):
+        if not self.switch_service():
+            return
+        if self.workflow.state.get("pending"):
+            QMessageBox.information(self, "原请求尚未确认", "请先继续原冻结请求，不能用其他任务替代")
+            return
+        identifier, accepted = QInputDialog.getText(self, "按任务 ID 恢复", "成功结果仅查询并缓存，仍需点击更新原理图；历史版本只读预览。输入本服务的 32 位任务 ID：")
+        if accepted and identifier.strip():
+            self.launch(lambda task: self.workflow.resume(identifier.strip(), stop_event=task.stop_event), "正在核验并恢复指定任务…")
+
+    def read_selection(self):
+        def done(value):
+            s = value.get("selection") or {}
+            self.selection_label.setText(f"节点 {len(s.get('node_ids', []))}，连接 {len(s.get('edge_ids', []))}；"
+                + ("本地结构已修改，不能覆盖反馈" if value.get("client_graph_dirty") else "结构与基线一致"))
+        self.launch(lambda task: self.workflow.selection(), "正在回读图纸及选中对象…", done)
+
+    def show_terminal(self, value):
+        if not isinstance(value, dict) or not value.get("terminal"):
+            return
+        job, d = value["terminal"], value.get("diagnostic") or {}
+        interaction = d.get("interaction_status") or (job.get("summary") or {}).get("interaction_status")
+        self.status.setText(f"本轮 {job['status']} · {interaction or '请查看诊断'}；当前成功图保留")
+        self.log.appendPlainText(d.get("message") or json.dumps(job.get("error") or job.get("summary"), ensure_ascii=False))
+        self.append_conversation("assistant", d.get("message") or (job.get("error") or {}).get("message") or "本轮未发布新图，当前成功图保留")
+        self.choices.clear()
+        for item in d.get("choices") or d.get("candidates") or []:
+            self.choices.addItem(str(item.get("label") or item.get("message") or item) if isinstance(item, dict) else str(item), item)
+        self.composer_changed()
+        self.refresh_summary()
+
+    def new_feedback(self):
+        def done(value):
+            self.feedback.clear()
+            self.choices.clear()
+            self.render()
+        self.launch(lambda task: self.workflow.new_feedback(), "正在清除本轮接续与选择目标…", done)
+
+    def finish_round(self):
+        if not self.switch_service():
+            return
+        try:
+            self.save_drafts()
+            self.workflow.finish()
+            self.status.setText("本轮已在本地结束，成果和草稿已保存；新反馈目标可继续")
+            self.render()
+        except ValueError as exc:
+            QMessageBox.information(self, "暂不能结束", str(exc))
+
+    def new_design(self):
+        if not self.switch_service():
+            return
+        if self.workflow.state.get("success") or self.workflow.state.get("import") or self.workflow.state.get("operation"):
+            answer = QMessageBox.question(self, "新建设计", "开始新设计将清空当前对话和输入；历史任务仍可在版本记录查看。不会自动更新或清空原理图。继续吗？")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.workflow.arm_new_design()
+        self.path.clear()
+        for widget in (self.user_text, self.feedback, self.run_name):
+            widget.blockSignals(True)
+            widget.clear()
+            widget.blockSignals(False)
+        self.status.setText("已准备新设计；生成结果不会自动写入画布")
+        self.render()
+
+    def test_connection(self):
+        def work(task):
+            self.workflow.client.health()
+            caps = self.workflow.client.capabilities()
+            if str(caps.get("api_version", "")).split(".")[0] != "1" or caps.get("graph_schema") != "ai-eda-graph-ir/v2.0":
+                raise ValueError("服务协议不兼容，需要 API 1.x 与 Graph IR v2")
+            return caps
+        self.launch(work, "正在检测服务和协议能力…", lambda caps: self.status.setText(
+            f"服务可访问 · API {caps.get('api_version')} · {caps.get('execution_mode')}；模型和数据库需要单独测试"))
+
+    def download_report(self, current):
+        if not self.switch_service():
+            return
+        job = (self.workflow.state.get("success" if current else "operation") or {}).get("job") or {}
+        if not job.get("report_url"):
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "保存 HTML 报告", str(Path.home() / f"rf-eda-{job['job_id']}.html"), "HTML (*.html)")
+        if path:
+            if Path(path).suffix.lower() not in (".html", ".htm"):
+                path += ".html"
+            self.launch(lambda task: self.workflow.client.download_html(job["report_url"], path), "正在下载报告…",
+                lambda saved: QDesktopServices.openUrl(QUrl.fromLocalFile(str(saved))))
+
+    def show_document(self, title, value):
+        from .management_ui import JsonView
+        JsonView(title, value, self).exec()
+
+    def show_requirements(self):
+        if not self.switch_service():
+            return
+        job = self.workflow.state.get("success", {}).get("job")
+        if job:
+            self.launch(lambda task: self.workflow.client.requirements(job["job_id"]), "正在读取设计指标要求…",
+                self.show_requirements_table)
+
+    def show_history(self):
+        if not self.switch_service():
+            return
+        rows = {row["job_id"]: row for row in [*(self.workflow.state.get("history") or []),
+            *(self.workflow.state.get("interactions") or [])] if row.get("job_id")}
         if not rows:
-            self.conversation_view.setHtml(
-                "<div style='margin:24px;color:#666'>"
-                "<h3>从设计要求开始</h3>"
-                "<p>输入链路需求或附加 Word。生成成功后，可在这里提问、补充或要求修改。</p>"
-                "</div>")
+            QMessageBox.information(self, "版本记录", "当前服务、图纸没有本地任务记录；可使用任务 ID 恢复查询")
             return
-        cards = []
-        for row in rows[-40:]:
-            is_user = row.get("role") == "user"
-            name = "你" if is_user else "设计助手"
-            color = "#e8f2ff" if is_user else "#f2f4f5"
-            body = escape(str(row.get("message", ""))).replace("\n", "<br>")
-            cards.append(f"<div style='background:{color};padding:12px;margin:10px 6px;"
-                         f"border-radius:8px'><b>{name}</b><p>{body}</p></div>")
-        self.conversation_view.setHtml("".join(cards))
-        self.conversation_view.verticalScrollBar().setValue(
-            self.conversation_view.verticalScrollBar().maximum())
+        labels = [f"{row['job_id']} · {row.get('status', 'succeeded')} · {row.get('run_name') or ''}" for row in reversed(list(rows.values()))]
+        label, accepted = QInputDialog.getItem(self, "版本记录", "仅查询预览，不改变当前图或恢复目标", labels, 0, False)
+        if not accepted:
+            return
+        identifier = label.split(" · ", 1)[0]
+        def done(value):
+            self.status.setText("已读取历史任务；当前图、待确认请求及恢复目标保持不变")
+            self.show_document("历史任务预览", value)
+        self.launch(lambda task: self.workflow.inspect(identifier), "正在只读查询历史任务…", done)
 
-    @Slot()
-    def start_generation(self) -> None:
-        if self._thread is not None or self._report_thread is not None:
+    def export_graph(self):
+        if not self.switch_service():
             return
-        current = self._state.get("current_job")
-        mode = "revision" if current and not self._state.get("new_design") and self._input_kind != "json" else self._input_kind
-        if (mode == "revision" and self._state.get("current_service_url")
-                and self.endpoint_edit.text().strip() != self._state["current_service_url"]):
-            QMessageBox.warning(self, "服务地址不一致", "当前成功图属于其他服务，请切回原服务再提交反馈。")
-            return
-        instruction = self.user_text_edit.toPlainText().strip()
-        if mode in {"text", "revision"} and not instruction:
-            QMessageBox.warning(self, "缺少设计要求", "请先输入设计要求或反馈内容。")
-            return
-        if mode in {"word", "json"} and not self.path_edit.text():
-            QMessageBox.warning(self, "缺少文件", "请先选择输入文件。")
-            return
-        if mode == "revision" and not (self._state.get("placement") or {}).get("document_fingerprint"):
-            QMessageBox.warning(self, "无法安全反馈", "当前成功图没有可核验的图纸快照，无法安全更新原理图。")
-            return
-        self._start_worker("", mode=mode, instruction=instruction)
+        state = self.workflow.state
+        raw = state.get("operation", {}).get("candidate_graph") or state.get("success", {}).get("graph") or state.get("local_graph")
+        path, _ = QFileDialog.getSaveFileName(self, "保存 Graph IR", str(Path.home() / "graph-ir.json"), "JSON (*.json)")
+        if raw is not None and path:
+            Path(path).write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    @Slot()
-    def resume_generation(self) -> None:
-        if self._thread is not None:
+    def open_management(self, page=0):
+        if not self.switch_service():
             return
-        last_job = self._state.get("last_job") or {}
-        pending = self._state.get("pending")
-        status_url = (last_job.get("status_url") or self._settings.value("status_url", "")) if not pending or last_job.get("status") in {"queued", "running"} else ""
-        saved_resume = bool(status_url)
-        if not status_url:
-            job_id, accepted = QInputDialog.getText(self, "接续任务", "任务 ID（32 位小写十六进制）：")
-            if accepted and len(job_id.strip()) == 32 and all(c in "0123456789abcdef" for c in job_id.strip()):
-                status_url = f"/api/v1/jobs/{job_id.strip()}"
-        if status_url:
-            if saved_resume:
-                self.endpoint_edit.setText(self._state.get("last_service_url") or self._settings.value("service_url", DEFAULT_URL))
-            self._start_worker(status_url, mode="resume")
-
-    def _start_worker(self, resume_url: str, *, mode: str,
-                      instruction: str = "") -> None:
-        self._set_busy(True)
-        self._job_id = ""
-        self._last_sequence = 0
-        self._last_progress_message = ""
-        self._announced_success = False
-        self.log.appendPlainText("\n开始处理设计任务…")
-        self._settings.setValue("service_url", self.endpoint_edit.text().strip())
-        self._state["service_url"] = self.endpoint_edit.text().strip()
-        request_id = uuid.uuid4().hex if not resume_url and mode != "json" else ""
-        if request_id:
-            self._state["pending"] = {"request_id": request_id, "mode": mode,
-                                      "instruction": instruction,
-                                      "path": self.path_edit.text(),
-                                      "run_name": self.run_name_edit.text()}
-        message_added = False
-        if not resume_url:
-            description = (f"附件：{Path(self.path_edit.text()).name}\n" if mode in {"word", "json"}
-                           else "") + (instruction or "请按附件生成原理图")
-            self._append_conversation("user", description)
-            message_added = True
-        try:
-            self._save_state()
-        except (OSError, ValueError) as exc:
-            if message_added:
-                self._state["conversation"].pop()
-                self._render_conversation()
-            self._set_busy(False)
-            QMessageBox.warning(self, "无法保存任务状态", str(exc))
-            return
-        thread = QThread(self)
-        worker = GenerationWorker(
-            mode, self.path_edit.text(), self.endpoint_edit.text().strip(),
-            self.token_edit.text().strip(), instruction,
-            self.run_name_edit.text(), resume_url, request_id,
-            self._state.get("current_job"), self._state.get("placement"),
-            self._state.get("continuation_job_id", ""))
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.progress.connect(self.log.appendPlainText)
-        worker.job_state.connect(self.on_job_state)
-        worker.completed.connect(self.generation_completed)
-        worker.failed.connect(self.generation_failed)
-        worker.completed.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
-        worker.completed.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(self._worker_finished)
-        thread.finished.connect(thread.deleteLater)
-        self._thread = thread
-        self._worker = worker
-        thread.start()
-
-    @Slot(object)
-    def on_job_state(self, job: dict) -> None:
-        job_id = str(job.get("job_id", ""))
-        if job_id:
-            self._state["last_job"] = job
-            self._state["last_service_url"] = self.endpoint_edit.text().strip()
-            self.last_label.setText(f"最近任务：{job_id} · {job.get('status', '未知')}")
-        if job_id and job_id != self._job_id:
-            if job_id != self._settings.value("job_id", ""):
-                self._report_url = ""
-                self._settings.remove("report_url")
-            self._job_id = job_id
-            self._settings.setValue("job_id", job_id)
-            self._settings.setValue("status_url", job.get("status_url", ""))
-            self._settings.setValue("service_url", self.endpoint_edit.text().strip())
-            self._settings.sync()
-            self.log.appendPlainText(f"任务 ID：{job_id}")
-        status = str(job.get("status", ""))
-        if status in {"succeeded", "needs_attention", "failed"}:
-            report_url = job.get("report_url")
-            self._report_url = report_url if isinstance(report_url, str) else ""
-            if self._report_url:
-                self._settings.setValue("report_url", self._report_url)
-                self._settings.sync()
-                self.log.appendPlainText("HTML 设计报告已可下载")
-            else:
-                self._settings.remove("report_url")
-        progress = job.get("progress") or {}
-        if not isinstance(progress, dict):
-            progress = {}
-        stage = progress.get("stage_label") or job.get("stage") or ""
-        message = progress.get("message") or ""
-        details = [f"状态：{status}", str(stage), str(message)]
-        subtask = progress.get("subtask")
-        if isinstance(subtask, dict) and subtask.get("index") and subtask.get("total"):
-            details.append(f"子任务 {subtask['index']}/{subtask['total']}")
-        if isinstance(progress.get("elapsed_seconds"), (int, float)):
-            details.append(f"已执行 {int(progress['elapsed_seconds'])} 秒")
-        if isinstance(progress.get("queue_seconds"), (int, float)) and status == "queued":
-            details.append(f"已排队 {int(progress['queue_seconds'])} 秒")
-        if isinstance(progress.get("activity_elapsed_seconds"), (int, float)):
-            details.append(f"当前等待 {int(progress['activity_elapsed_seconds'])} 秒")
-        self.status_label.setText(" | ".join(part for part in details if part))
-        first = progress.get("first_event_sequence")
-        if isinstance(first, int) and first > self._last_sequence + 1:
-            self.log.appendPlainText("部分较早的进度记录已超出服务保留窗口")
-            self._last_sequence = first - 1
-        had_new_event = False
-        for event in progress.get("events") or []:
-            if not isinstance(event, dict):
-                continue
-            sequence = event.get("sequence")
-            if isinstance(sequence, int) and sequence > self._last_sequence:
-                self.log.appendPlainText(str(event.get("message", "")))
-                self._last_sequence = sequence
-                had_new_event = True
-        if message and message != self._last_progress_message:
-            if not had_new_event:
-                self.log.appendPlainText(f"{stage}：{message}")
-            self._last_progress_message = message
-        if status == "succeeded" and not self._announced_success:
-            self._announced_success = True
-            summary = job.get("summary") or {}
-            if isinstance(summary, dict):
-                for key in ("contract_warnings", "conversion_warnings"):
-                    for warning in summary.get(key) or []:
-                        self.log.appendPlainText("设计警告：" + json.dumps(warning, ensure_ascii=False))
-            if self._worker is not None and self._worker._mode == "inspect":
-                self.log.appendPlainText("任务成功；本次仅查看历史状态，不修改当前图。")
-            else:
-                self.log.appendPlainText("任务成功，正在下载 Graph IR…")
-        elif status in {"failed", "needs_attention"}:
-            self._settings.remove("status_url")
-        try:
-            self._save_state()
-        except (OSError, ValueError) as exc:
-            self.log.appendPlainText(f"任务状态未能保存：{exc}")
-
-    @Slot()
-    def start_report_download(self) -> None:
-        self._start_report_download_for(self._state.get("last_job") or {},
-                                        self._state.get("last_service_url", ""))
-
-    @Slot()
-    def start_current_report_download(self) -> None:
-        current = self._state.get("current_job") or {}
-        if not current.get("report_url"):
-            return
-        self._start_report_download_for(current, self._state.get("current_service_url", ""))
-
-    def _start_report_download_for(self, job: dict, service_url: str) -> None:
-        if self._report_thread is not None or self._thread is not None:
-            return
-        report_url = job.get("report_url")
-        if not report_url:
-            return
-        download_dir = Path.home() / "Downloads"
-        if not download_dir.is_dir():
-            download_dir = Path.home()
-        suggested = download_dir / f"ai-eda-report-{job.get('job_id', 'job')}.html"
-        destination, _ = QFileDialog.getSaveFileName(
-            self, "保存 HTML 设计报告", str(suggested), "HTML 文件 (*.html *.htm)")
-        if not destination:
-            return
-        if Path(destination).suffix.lower() not in {".html", ".htm"}:
-            destination += ".html"
-        self.log.appendPlainText(f"正在下载 HTML 报告：{destination}")
-        thread = QThread(self)
-        worker = ReportDownloadWorker(service_url or self.endpoint_edit.text().strip(),
-                                      report_url, destination, self.token_edit.text().strip())
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.completed.connect(self.report_downloaded)
-        worker.failed.connect(self.report_download_failed)
-        worker.completed.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
-        worker.completed.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(self._report_worker_finished)
-        thread.finished.connect(thread.deleteLater)
-        self._report_thread = thread
-        self._report_worker = worker
-        self._set_busy(False)
-        thread.start()
-
-    @Slot()
-    def start_new_design(self) -> None:
-        if self._thread is not None:
-            return
-        if self._state.get("current_job"):
-            if not (self._state.get("placement") or {}).get("document_fingerprint"):
-                QMessageBox.warning(self, "无法安全替换", "当前图没有可核验的插件对象记录，请在新的空白原理图中开始设计。")
-                return
-            choice = QMessageBox.question(
-                self, "新建设计", "新任务成功后将替换本插件上次生成的图。旧图上的本地修改会阻止替换。继续吗？")
-            if choice != QMessageBox.StandardButton.Yes:
-                return
-        self._state["new_design"] = True
-        self._state["continuation_job_id"] = ""
-        self._input_kind = "text"
-        self.path_edit.clear()
-        self.summary_label.setText("新设计：输入文字要求，或附加 Word")
-        self.user_text_edit.clear()
-        self._append_conversation("assistant", "已开始新的设计。请描述目标链路，或附加 Word 技术协议。")
-        self._save_state()
-        self._update_controls()
-
-    @Slot()
-    def clear_feedback_target(self) -> None:
-        self._state["continuation_job_id"] = ""
-        self._save_state()
-        self.log.appendPlainText("已清除本轮接续目标；当前成功图保持不变。")
-        self._update_controls()
-
-    @Slot()
-    def show_current_requirements(self) -> None:
-        current = self._state.get("current_job") or {}
-        url = current.get("requirements_url")
-        if not url or self._requirements_thread is not None:
-            return
-        thread = QThread(self)
-        worker = RequirementsWorker(self._state.get("current_service_url") or
-                                    self.endpoint_edit.text().strip(), url,
-                                    self.token_edit.text().strip())
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.completed.connect(self.requirements_loaded)
-        worker.failed.connect(self.requirements_failed)
-        worker.completed.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
-        worker.completed.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(self._requirements_finished)
-        thread.finished.connect(thread.deleteLater)
-        self._requirements_thread = thread
-        self._requirements_worker = worker
-        self._set_busy(False)
-        thread.start()
-
-    @Slot(object)
-    def requirements_loaded(self, requirements: dict) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("当前已发布需求")
-        dialog.resize(640, 480)
-        layout = QVBoxLayout(dialog)
-        view = QPlainTextEdit()
-        view.setReadOnly(True)
-        view.setPlainText(json.dumps(requirements, ensure_ascii=False, indent=2))
-        layout.addWidget(view)
-        close = QPushButton("关闭")
-        close.clicked.connect(dialog.accept)
-        layout.addWidget(close)
+        from .management_ui import ManagementDialog
+        dialog = ManagementDialog(self.workflow.service, self.token.text().strip(), self)
+        dialog.setStyleSheet(self.styleSheet())
+        dialog.tabs.setCurrentIndex(page)
         dialog.exec()
 
-    @Slot(str)
-    def requirements_failed(self, message: str) -> None:
-        QMessageBox.warning(self, "读取需求失败", message)
+    def show_requirements_table(self, baseline):
+        from .requirements_ui import RequirementsDialog
+        dialog = RequirementsDialog(baseline, self)
+        dialog.setStyleSheet(self.styleSheet())
+        dialog.exec()
 
-    @Slot()
-    def _requirements_finished(self) -> None:
-        self._requirements_thread = None
-        self._requirements_worker = None
-        self._update_controls()
+    def show_interface_help(self):
+        self.show_document("整页更新接口", {
+            "本版": "生成与反馈只使用后端设计，不读取画布快照。只有点击更新原理图才整页重绘。",
+            "宿主": "优先 ClearSchematicPage；或完整 GetItems 枚举 UUID 后 DeleteItems。所有清空和创建都在同一事务。",
+            "缺少能力": "明确报错并保留旧图，不退化为只删一部分旧对象。",
+            "协议": "plugins/protocol/schematic/schematic_clear.proto；docs/手动更新与清空图页接口.md"})
 
-    @Slot()
-    def show_history(self) -> None:
-        history = self._state.get("history") or []
-        if not history:
-            QMessageBox.information(self, "版本记录", "本地没有已保存的任务记录。")
+    def update_schematic(self):
+        if not self.switch_service():
             return
-        labels = [f"{row.get('job_id')} · {row.get('status')} · {row.get('run_name', '')}"
-                  for row in reversed(history) if row.get("job_id")]
-        selected, accepted = QInputDialog.getItem(self, "版本与记录", "选择任务接续：",
-                                                  labels, 0, False)
-        if not accepted or not selected:
+        answer = QMessageBox.question(self, "更新原理图", "将清空当前活动原理图页的全部旧内容，并按当前后端 Graph IR 重新绘制。人工改动不会保留，也不会传给 AI。是否更新？")
+        if answer == QMessageBox.StandardButton.Yes:
+            self.launch(lambda task: self.workflow.apply_current_graph(stop_event=task.stop_event), "正在更新当前原理图页…")
+
+    def clear_conversation(self):
+        if not self.switch_service():
             return
-        job_id = selected.split(" · ", 1)[0]
-        row = next(item for item in history if item.get("job_id") == job_id)
-        self.endpoint_edit.setText(row.get("service_url") or self._state.get("service_url") or DEFAULT_URL)
-        self._start_worker(f"/api/v1/jobs/{job_id}", mode="inspect")
+        self.workflow.clear_conversation()
+        self.render_conversation()
+        self.status.setText("对话已清空并保存；任务和画布未删除")
 
-    @Slot(str)
-    def report_downloaded(self, path: str) -> None:
-        self.log.appendPlainText(f"HTML 报告已保存：{path}")
+    def clear_records(self):
+        if not self.switch_service():
+            return
+        answer = QMessageBox.question(self, "清除任务记录", "清除本会话的对话、输入、任务和版本记录。不会删除后端文件或当前原理图；绘图收据保留，避免丢失操作状态。继续吗？")
+        if answer == QMessageBox.StandardButton.Yes:
+            self.workflow.clear_records()
+            self.path.clear()
+            self.choices.clear()
+            self.log.clear()
+            self.sequences.clear()
+            self.render(restore_draft=True)
+            self.status.setText("本会话任务记录已清除；画布和后端文件保留")
+
+    def verify_canvas(self):
+        if not self.switch_service():
+            return
+        answer = QMessageBox.question(self, "处理未确认绘图", "上次绘图响应未知。请先在 KiCad 结束或撤销相关操作，必要时重新打开原理图编辑器。确认已处理，并允许下次按后端结果重新清空整页吗？本操作不检查图纸内容，也不会立即重绘。")
+        if answer == QMessageBox.StandardButton.Yes:
+            self.workflow.permit_full_page_retry(user_confirmed=True)
+            self.status.setText("已允许再次手动更新；尚未读取、核验或重绘当前图页")
+            self.render()
+
+    def recover_legacy(self):
+        if not self.switch_service():
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "选择旧版本的 session.json", str(Path.home()), "会话 JSON (*.json)")
+        if not path:
+            return
+        answer = QMessageBox.question(self, "恢复旧版会话", "将从同一服务读取旧成功任务，并核验当前图纸中记录的对象和连接。不会重跑 AI 或重新画图。请确认已切回对应图纸，继续吗？")
+        if answer == QMessageBox.StandardButton.Yes:
+            self.launch(lambda task: self.workflow.recover_legacy(path, stop_event=task.stop_event), "正在只读核验旧版图纸和任务…")
+
+    def reload_session(self):
+        if self.task:
+            return
         try:
-            os.startfile(path)
-        except OSError as exc:
-            QMessageBox.warning(self, "打开报告失败", f"报告已下载到 {path}\n{exc}")
+            origin = ServiceClient(self.endpoint.text().strip()).service_url
+            if self.credential_origin and self.credential_origin != origin:
+                self.token.clear()
+            self.credential_origin = origin
+            client = ServiceClient(origin, token=self.token.text().strip())
+            project = str(self.settings.value(self.project_setting(client.service_url), ""))
+            self.workflow = ClientWorkflow(client, self.store, project_id=project)
+            self.persistence_error = ""
+            self.render(restore_draft=True)
+            self.status.setText("已重读当前服务的会话；请核对任务后恢复")
+        except (AiServiceError, OSError, ValueError) as exc:
+            self.persistence_error = str(exc)
+            self.status.setText("会话仍无法安全读取：" + str(exc))
+            self.render_busy()
 
-    @Slot(str)
-    def report_download_failed(self, message: str) -> None:
-        self.log.appendPlainText(f"HTML 报告下载失败：{message}")
-        QMessageBox.warning(self, "报告下载失败", message)
+    def bind_current(self):
+        if self.task:
+            return
+        origin = ServiceClient(self.endpoint.text().strip()).service_url
+        if self.credential_origin and self.credential_origin != origin:
+            self.token.clear()
+        self.credential_origin = origin
+        client = ServiceClient(origin, token=self.token.text().strip())
+        from .generator import capture_target
+        def done(target):
+            workflow = ClientWorkflow(client, self.store, project_id=target["key"])
+            workflow.save(target=target)
+            self.workflow, self.persistence_error = workflow, ""
+            self.settings.setValue("service_url", origin)
+            self.render(restore_draft=True)
+            self.status.setText("已切换到当前图纸的独立会话；原图纸任务与记录保留")
+        self.launch(lambda task: capture_target(readback=False), "正在读取当前图纸身份…", done, require_session=False)
 
-    @Slot()
-    def _report_worker_finished(self) -> None:
-        self._report_thread = None
-        self._report_worker = None
-        self._set_busy(self._thread is not None)
+    def choose_suggestion(self, index):
+        if not self.switch_service():
+            return
+        choice = self.choices.itemData(index)
+        label = self.choices.itemText(index)
+        if label:
+            self.feedback.setPlainText(label)
+        self.status.setText("已将后端候选填入反馈草稿；尚未提交，不定位或读取画布")
 
-    @Slot(object)
-    def generation_completed(self, outcome: dict) -> None:
-        self._settings.remove("status_url")
-        job = outcome.get("job")
-        report: GenerationReport | None = outcome.get("report")
-        diagnostic = outcome.get("diagnostic")
-        if isinstance(job, dict):
-            if diagnostic:
-                job["diagnostic"] = diagnostic
-            self._state["last_job"] = job
-            history = self._state.setdefault("history", [])
-            entry = next((item for item in history if item.get("job_id") == job.get("job_id")), None)
-            if entry is None:
-                entry = {"job_id": job.get("job_id")}
-                history.append(entry)
-            entry.update({"status": job.get("status"), "run_name": job.get("run_name"),
-                          "revision_info": job.get("revision_info"),
-                          "service_url": self.endpoint_edit.text().strip()})
-        self._state["pending"] = None
-        if report is not None:
-            self.log.appendPlainText("\n" + report.format())
-            self._append_conversation("assistant", "原理图已生成并应用到当前图纸。\n" + report.format())
-            placement = {
-                "document_token": report.document_token,
-                "document_fingerprint": report.document_fingerprint,
-                "item_ids": report.item_ids,
-                "item_fingerprints": report.item_fingerprints,
-                "node_item_ids": report.node_item_ids,
-                "edge_item_ids": report.edge_item_ids,
-            }
-            if isinstance(job, dict) and job.get("status") == "succeeded":
-                self._state["current_job"] = job
-                self._state["current_service_url"] = self.endpoint_edit.text().strip()
-                self._state["placement"] = placement
-                self._state["continuation_job_id"] = ""
-                self._state["new_design"] = False
-                self._input_kind = "text"
-                self.path_edit.clear()
-                self.user_text_edit.clear()
-                self.summary_label.setText("可以继续提问，或描述希望修改的部分")
-            elif job is None:
-                self._state["current_job"] = None
-                self._state["placement"] = placement
-                self._state["continuation_job_id"] = ""
-                self._state["new_design"] = False
-            QMessageBox.information(self, "生成完成", report.format())
-        elif isinstance(job, dict) and outcome.get("inspect"):
-            self.log.appendPlainText(f"已查询历史任务 {job.get('job_id')}：{job.get('status')}；当前图未改变。")
-        elif isinstance(job, dict):
-            status = job.get("status")
-            interaction = (job.get("summary") or {}).get("interaction_status")
-            message = (diagnostic or {}).get("message") or (job.get("error") or {}).get("message") or "本轮未发布新图"
-            self.log.appendPlainText(f"本轮结果：{status} / {interaction or '—'}：{message}")
-            self._append_conversation("assistant", f"{message}\n当前成功图保持不变。")
-            if isinstance(diagnostic, dict):
-                for choice in diagnostic.get("choices") or []:
-                    if isinstance(choice, dict):
-                        self.log.appendPlainText(f"可选补充：{choice.get('label', '')}")
-                for risk in diagnostic.get("remaining_risks") or []:
-                    self.log.appendPlainText(f"剩余风险：{risk}")
-                if diagnostic.get("engineering_assessment"):
-                    self.log.appendPlainText(f"工程判断：{diagnostic['engineering_assessment']}")
-            if interaction in {"answered", "awaiting_input", "revision_failed", "budget_exhausted"} and diagnostic:
-                self._state["continuation_job_id"] = job.get("job_id", "")
-            QMessageBox.information(self, "本轮设计结果", message + "\n当前成功图保持不变。")
+    def append_conversation(self, role, content):
+        if not self.workflow or not str(content).strip():
+            return
+        rows = list(self.workflow.state.get("conversation") or [])
+        rows.append({"role": role, "content": str(content)[:12000]})
         try:
-            self._save_state()
-        except (OSError, ValueError) as exc:
-            self.log.appendPlainText(f"设计状态未能保存：{exc}")
-        self._update_controls()
+            self.workflow.save(conversation=rows[-100:])
+        except (AiServiceError, OSError, ValueError) as exc:
+            self.persistence_error = str(exc)
+            self.log.appendPlainText("对话记录未保存，请重读会话后核对任务：" + str(exc))
+            self.render_busy()
+            return
+        self.render_conversation()
 
-    @Slot(object)
-    def generation_failed(self, failure: dict) -> None:
-        message = failure.get("message", "任务失败")
-        if not failure.get("keep_pending"):
-            self._state["pending"] = None
+    def render_conversation(self):
+        rows = self.workflow.state.get("conversation") or []
+        if not rows:
+            self.conversation.setHtml("<div style='padding:18px;color:#dfe7ee'>"
+                "<h3>从技术协议或设计目标开始</h3>"
+                "<p style='color:#99aabd'>上传 Word，或描述你的设计目标。<br>附件与补充文字会一起用于同一项设计。</p></div>")
+            return
+        cards = []
+        for row in rows[-30:]:
+            user = row.get("role") == "user"
+            bg, fg = ("#242e24", "#e1ebd8") if user else ("#191f26", "#e0e7ed")
+            text = escape(str(row.get("content", ""))).replace("\n", "<br>")
+            # QTextDocument 支持 table 背景，避免主题 Highlight 色铺满对话区。
+            cards.append(f"<table width='100%' cellspacing='0' cellpadding='12' bgcolor='{bg}'>"
+                f"<tr><td style='color:{fg}'><b>{'你' if user else 'RF EDA · 设计助手'}</b>"
+                f"<p>{text}</p></td></tr></table><p style='font-size:4px'>&nbsp;</p>")
+        self.conversation.setHtml("".join(cards))
+        self.conversation.verticalScrollBar().setValue(self.conversation.verticalScrollBar().maximum())
+
+    def stop_waiting(self):
+        if self.task and not self.mutating:
+            self.task.stop_event.set()
+            self.status.setText("正在停止客户端等待，后端继续；当前请求结束后退出")
+            self.buttons["stop"].setEnabled(False)
+
+    def closeEvent(self, event):
+        self.save_drafts()
+        if self.task:
+            self.close_when_idle = True
+            self.stop_waiting()
+            self.status.setText("任务已保存，当前操作结束后关闭；后端任务继续")
+            event.ignore()
         else:
-            pending = self._state.get("pending") or {}
-            message += ("\n请求结果尚不确定，已保留请求 ID："
-                        + pending.get("request_id", "")
-                        + "。请先按任务 ID 查询服务端记录，不要重新提交。")
-        self.log.appendPlainText(f"\n生成失败：{message}")
-        self._append_conversation("assistant", f"本轮未完成：{message}")
-        try:
-            self._save_state()
-        except (OSError, ValueError) as exc:
-            self.log.appendPlainText(f"设计状态未能保存：{exc}")
-        QMessageBox.critical(self, "生成失败", message)
-
-    @Slot()
-    def _worker_finished(self) -> None:
-        self._thread = None
-        self._worker = None
-        self._set_busy(False)
-
-    def _save_state(self) -> None:
-        self._store.save(self._state)
-
-    @Slot()
-    def _update_controls(self) -> None:
-        self._set_busy(self._thread is not None)
-
-    def _set_busy(self, busy: bool) -> None:
-        idle = (not busy and self._report_thread is None
-                and self._connection_thread is None and self._requirements_thread is None)
-        self.word_button.setEnabled(idle)
-        self.text_button.setEnabled(idle)
-        self.json_button.setEnabled(idle)
-        self.endpoint_edit.setEnabled(idle)
-        self.token_edit.setEnabled(idle)
-        self.user_text_edit.setEnabled(idle)
-        self.run_name_edit.setEnabled(idle and self._input_kind != "json")
-        current = bool(self._state.get("current_job")) and not self._state.get("new_design")
-        self.generate_button.setText("提交补充" if current and self._state.get("continuation_job_id")
-                                     and self._input_kind != "json" else
-                                     "发送反馈" if current and self._input_kind != "json" else
-                                     "生成本地 JSON" if self._input_kind == "json" else "开始设计")
-        self.composer_group.setTitle("继续讨论当前原理图" if current else "开始设计")
-        self.composer_hint.setText(
-            "描述要修改的链路或提出问题。仅成功生成的新版本会替换当前图。" if current else
-            "输入设计要求，也可以附加 Word 技术协议。")
-        current_job = self._state.get("current_job") or {}
-        current_id = str(current_job.get("job_id", ""))
-        self.current_label.setText("当前图：" + (current_id[:8] + "…（已应用）" if current else
-                                       "新建设计中" if self._state.get("new_design") else "尚未生成"))
-        last_job = self._state.get("last_job") or {}
-        last_id = str(last_job.get("job_id", ""))
-        self.last_label.setText("最近任务：" + (f"{last_id} · {last_job.get('status', '未知')}"
-                                              if last_id else "尚未提交"))
-        self.text_button.setEnabled(idle and bool(self.path_edit.text()))
-        has_input = bool(self.user_text_edit.toPlainText().strip()) or bool(self.path_edit.text())
-        if current and self._input_kind != "json":
-            has_input = bool(self.user_text_edit.toPlainText().strip())
-        self.generate_button.setEnabled(idle and has_input and not self._state.get("pending"))
-        self.resume_button.setEnabled(idle)
-        self.report_button.setEnabled(idle and bool(self._report_url))
-        self.current_report_button.setEnabled(idle and bool((self._state.get("current_job") or {}).get("report_url")))
-        self.new_design_button.setEnabled(idle)
-        self.new_target_button.setEnabled(idle and bool(self._state.get("continuation_job_id")))
-        self.requirements_button.setEnabled(idle and bool((self._state.get("current_job") or {}).get("requirements_url")))
-        self.history_button.setEnabled(idle and bool(self._state.get("history")))
-        self.close_button.setEnabled(idle)
-        self.connection_button.setEnabled(idle)
-        self.progress.setRange(0, 0 if busy else 1)
-        if not busy:
-            self.progress.setValue(1)
-
-    def closeEvent(self, event: object) -> None:  # noqa: N802 - Qt virtual name
-        if (self._thread is not None or self._report_thread is not None
-                or self._connection_thread is not None):
-            QMessageBox.information(self, "正在处理", "请等待当前任务完成后再关闭窗口。")
-            event.ignore()
-            return
-        if self._requirements_thread is not None:
-            QMessageBox.information(self, "正在处理", "请等待当前任务完成后再关闭窗口。")
-            event.ignore()
-            return
-        event.accept()
+            event.accept()

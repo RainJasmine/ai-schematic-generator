@@ -25,14 +25,21 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
     return tuple(text for item in value if (text := _text(item)))
 
 
-def _optional_positive_int(value: Any) -> int | None:
-    if value is None or isinstance(value, bool):
+def _optional_variant_int(value: Any, *, name: str, node_id: str,
+                          port_id: str, diagnostics: list) -> int | None:
+    """Variant IDs are JSON integers; 0 explicitly identifies common pins.
+
+    Invalid supplied values must not silently become unspecified units, which
+    could select another physical pin.  Keep a diagnostic for strict import.
+    """
+    if value is None:
         return None
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return None
-    return number if number > 0 else None
+    if type(value) is int and value >= 0:
+        return value
+    diagnostics.append(Diagnostic("error", f"PORT_{name.upper()}_INVALID",
+                                  f"端口 {port_id} 的 {name} 必须为非负整数或 null",
+                                  node_id=node_id))
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +65,46 @@ class Diagnostic:
         ]
         suffix = f" ({', '.join(refs)})" if refs else ""
         return f"{self.code}: {self.message}{suffix}"
+
+
+def _validate_delivery(raw: dict, diagnostics: list[Diagnostic]) -> None:
+    """Respect explicit failure evidence in local JSON, as well as HTTP jobs.
+
+    Historical graphs may omit these summaries.  Unknown v2 minor fields remain
+    intact in ``source``.  Warning-only completion is deliverable; an explicitly
+    failed/pending graph or nonzero ERC errors is never promoted to success.
+    """
+    summary = raw.get("conversion_report_summary")
+    summaries = [("task6_status", raw.get("task6_status"))]
+    if isinstance(summary, dict):
+        summaries.append(("conversion_report_summary.task6_status", summary.get("task6_status")))
+    for field_name, value in summaries:
+        if value is not None and value not in ("completed", "completed_with_warnings"):
+            diagnostics.append(Diagnostic("error", "GRAPH_NOT_DELIVERABLE",
+                                          f"{field_name}={value!r}，不能作为完成图导入"))
+    erc = raw.get("erc_summary")
+    if erc is None:
+        return
+    if not isinstance(erc, dict):
+        diagnostics.append(Diagnostic("error", "ERC_SUMMARY_INVALID", "erc_summary 必须是对象"))
+        return
+    status = erc.get("status")
+    if status is not None and status not in ("completed", "completed_with_warnings", "passed"):
+        diagnostics.append(Diagnostic("error", "ERC_NOT_PASSED", f"ERC 状态为 {status!r}"))
+    counts = erc.get("counts")
+    if counts is not None and not isinstance(counts, dict):
+        diagnostics.append(Diagnostic("error", "ERC_SUMMARY_INVALID", "ERC counts 必须是对象"))
+    counters = [("error_count", erc.get("error_count"))]
+    if isinstance(counts, dict):
+        counters.append(("counts.errors", counts.get("errors")))
+    for name, count in counters:
+        if count is not None:
+            if type(count) is not int or count < 0:
+                diagnostics.append(Diagnostic("error", "ERC_SUMMARY_INVALID", f"ERC {name} 必须是非负整数"))
+            elif count:
+                diagnostics.append(Diagnostic("error", "ERC_ERRORS_PRESENT", f"ERC {name}={count}"))
+    if erc.get("errors"):
+        diagnostics.append(Diagnostic("error", "ERC_ERRORS_PRESENT", "ERC 含有错误诊断"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +277,7 @@ class GraphIR:
                 raise GraphIrError(f"JSON 字段 {name} 必须是数组")
 
         diagnostics: list[Diagnostic] = []
+        _validate_delivery(raw, diagnostics)
         if not graph_schema:
             diagnostics.append(
                 Diagnostic("warning", "GRAPH_SCHEMA_MISSING", "未声明 graph_schema，按 v2 兼容输入解析")
@@ -316,6 +364,16 @@ def _parse_nodes(
             diagnostics.append(Diagnostic("error", "NODE_ID_DUPLICATE", "节点 ID 重复，保留首次定义", node_id=node_id))
             continue
 
+        for field_name in ("binding_status", "model_binding_status"):
+            if field_name in item and item[field_name] != "bound":
+                diagnostics.append(Diagnostic("error", "MODEL_BINDING_NOT_READY",
+                                              f"{field_name}={item[field_name]!r}", node_id=node_id))
+        if item.get("binding_errors"):
+            diagnostics.append(Diagnostic("error", "MODEL_BINDING_ERRORS", "模型含有绑定错误", node_id=node_id))
+        if item.get("parameter_values") is not None:
+            diagnostics.append(Diagnostic("error", "PARAMETER_VALUES_FORBIDDEN",
+                                          "本版 Graph IR 参数值必须为 null，不能将其解释为已求解性能", node_id=node_id))
+
         raw_ports = item.get("ports", [])
         if isinstance(raw_ports, dict):
             raw_ports = [raw_ports]
@@ -336,12 +394,17 @@ def _parse_nodes(
                 diagnostics.append(Diagnostic("error", "PORT_ID_DUPLICATE", "同一节点内端口 ID 重复，保留首次定义", node_id=node_id))
                 continue
             local_ids.add(port_id)
+            if "required" in raw_port and type(raw_port["required"]) is not bool:
+                diagnostics.append(Diagnostic("error", "PORT_REQUIRED_INVALID",
+                                              f"端口 {port_id} 的 required 必须为布尔值", node_id=node_id))
             port = PortIR(
                 port_id=port_id,
                 pin_number=_text(raw_port.get("pin_number")),
                 pin_name=_text(raw_port.get("pin_name")),
-                unit=_optional_positive_int(raw_port.get("unit")),
-                body_style=_optional_positive_int(raw_port.get("body_style")),
+                unit=_optional_variant_int(raw_port.get("unit"), name="unit", node_id=node_id,
+                                           port_id=port_id, diagnostics=diagnostics),
+                body_style=_optional_variant_int(raw_port.get("body_style"), name="body_style", node_id=node_id,
+                                                 port_id=port_id, diagnostics=diagnostics),
                 direction=_text(raw_port.get("direction")) or "unknown",
                 domain=_text(raw_port.get("domain")),
                 compatible_domains=_string_tuple(raw_port.get("compatible_domains")),
@@ -352,6 +415,9 @@ def _parse_nodes(
             endpoint_map[(node_id, port_id)] = port
 
         model = item.get("model_metadata")
+        if model is not None and not isinstance(model, dict):
+            diagnostics.append(Diagnostic("error", "MODEL_METADATA_INVALID",
+                                          "model_metadata 必须是对象", node_id=node_id))
         model = model if isinstance(model, dict) else {}
         node = NodeIR(
             node_id=node_id,
@@ -409,6 +475,7 @@ def _parse_edges(
         target_port_id = _text(item.get("target_port_id"))
         status = _text(item.get("connection_status")) or "connected"
         edge_domain = _text(item.get("signal_domain"))
+        critical = _text(item.get("edge_type")) in {"signal", "lo_drive"}
         issues: list[str] = []
 
         def error(code: str, message: str) -> None:
@@ -419,6 +486,8 @@ def _parse_edges(
             error("EDGE_SOURCE_NODE_MISSING", "源节点不存在")
         if target_node_id not in node_map:
             error("EDGE_TARGET_NODE_MISSING", "目标节点不存在")
+        if critical and source_node_id == target_node_id:
+            error("EDGE_SELF_CONNECTION", "信号连接不能把同一节点连接到自身")
         source_port = endpoint_map.get((source_node_id, source_port_id))
         target_port = endpoint_map.get((target_node_id, target_port_id))
         if source_node_id in node_map and source_port is None:
@@ -430,15 +499,15 @@ def _parse_edges(
             diagnostics.append(Diagnostic("warning", "EDGE_NOT_CONNECTED", f"connection_status={status}", edge_id=edge_id))
         if source_port and source_port.direction not in ("output", "bidirectional", "unknown", ""):
             issues.append("PORT_DIRECTION_SUSPICIOUS")
-            diagnostics.append(Diagnostic("warning", "PORT_DIRECTION_SUSPICIOUS", "源端口方向可疑", edge_id=edge_id))
+            diagnostics.append(Diagnostic("error" if critical else "warning", "PORT_DIRECTION_SUSPICIOUS", "源端口方向可疑", edge_id=edge_id))
         if target_port and target_port.direction not in ("input", "bidirectional", "unknown", ""):
             issues.append("PORT_DIRECTION_SUSPICIOUS")
-            diagnostics.append(Diagnostic("warning", "PORT_DIRECTION_SUSPICIOUS", "目标端口方向可疑", edge_id=edge_id))
+            diagnostics.append(Diagnostic("error" if critical else "warning", "PORT_DIRECTION_SUSPICIOUS", "目标端口方向可疑", edge_id=edge_id))
         if (source_port and not _domain_supported(source_port, edge_domain)) or (
             target_port and not _domain_supported(target_port, edge_domain)
         ):
             issues.append("PORT_DOMAIN_MISMATCH")
-            diagnostics.append(Diagnostic("warning", "PORT_DOMAIN_MISMATCH", "连接信号域不被端口支持", edge_id=edge_id))
+            diagnostics.append(Diagnostic("error" if critical else "warning", "PORT_DOMAIN_MISMATCH", "连接信号域不被端口支持", edge_id=edge_id))
         structural = any(code.startswith("EDGE_") and code != "EDGE_NOT_CONNECTED" for code in issues)
         edges.append(
             EdgeIR(

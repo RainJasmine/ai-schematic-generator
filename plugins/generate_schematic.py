@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
 
@@ -21,9 +22,26 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 from ai_schematic.ui import GeneratorWindow  # noqa: E402
 
 
+def configure_font(app) -> None:
+    """Use an installed CJK font; also works when Qt has no system fallback."""
+    from PySide6.QtGui import QFont, QFontDatabase
+    choices = ("Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "PingFang SC")
+    available = set(QFontDatabase.families())
+    if os.name == "nt" and not any(family in available for family in choices):
+        font_path = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "msyh.ttc"
+        if font_path.is_file():
+            QFontDatabase.addApplicationFont(str(font_path))
+            available = set(QFontDatabase.families())
+    for family in choices:
+        if family in available:
+            app.setFont(QFont(family, 10))
+            break
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
-    app.setApplicationName("AI Schematic Generator")
+    app.setApplicationName("RF EDA AI Schematic Assistant")
+    configure_font(app)
     window = GeneratorWindow()
     window.show()
     return app.exec()
