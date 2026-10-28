@@ -89,6 +89,13 @@ class FakeCanvas:
         self.mutations += 1
         return FakeReport(parsed.source, target)
 
+    def clear_current_page(self, target, progress, *, on_checkpoint):
+        on_checkpoint({"target": deepcopy(target), "operation": "clear_page"})
+        if self.mode == "crash":
+            raise CanvasUncertain("fake clear outcome unknown")
+        self.cleared += 1
+        return 3
+
     def clear_graph_selection(self, previous):
         self.cleared += 1
 
@@ -184,6 +191,24 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.canvas.mutations, 1)
         self.assertTrue(self.canvas.calls[-1]["replace_all"])
         self.assertEqual(self.workflow.state["applied_job_id"], NEW_ID)
+
+    def test_default_clear_page_needs_no_graph_and_resets_import_receipt(self):
+        self.workflow.save(**{"import": {"old": True}, "applied_job_id": OLD_ID})
+        result = self.workflow.clear_current_page()
+        self.assertEqual(result["deleted_items_count"], 3)
+        self.assertEqual(self.canvas.cleared, 1)
+        self.assertFalse(self.workflow.state["uncertain"])
+        self.assertEqual(self.workflow.state["import"], {})
+        self.assertIsNone(self.workflow.state["applied_job_id"])
+
+    def test_unknown_clear_result_blocks_replay(self):
+        self.canvas.mode = "crash"
+        with self.assertRaises(CanvasUncertain):
+            self.workflow.clear_current_page()
+        self.assertTrue(self.workflow.state["uncertain"])
+        with self.assertRaises(ValueError):
+            self.workflow.clear_current_page()
+        self.assertEqual(self.canvas.cleared, 0)
 
     def test_feedback_without_applying_or_reading_canvas_produces_pending_new_graph(self):
         self.seed_success()

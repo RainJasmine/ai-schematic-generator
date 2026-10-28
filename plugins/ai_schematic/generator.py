@@ -586,6 +586,50 @@ def _check_created(response, requested: list, cls) -> list:
     return result
 
 
+def clear_current_page(target: dict, progress: Progress,
+                       on_checkpoint: Callable[[dict], None] | None = None) -> int:
+    """Clear the active page in one explicit undo transaction, without a Graph IR."""
+    with KiCadClient() as client:
+        context = _verify_target(client, target)
+        if on_checkpoint:
+            try:
+                on_checkpoint({"state": "mutating", "uncertain": True,
+                               "operation": "clear_page", "target": target})
+            except Exception as exc:
+                error = ApiError("无法保存清空操作日志，图页未修改。", code="KICAD_JOURNAL_SAVE_FAILED")
+                error.rollback_verified = True
+                raise error from exc
+        commit_id = None
+        commit_attempted = False
+        try:
+            commit_id = client.begin_commit()
+            if not commit_id:
+                raise GenerationUncertain("KiCad 未返回事务标识，清空结果待确认。")
+            _verify_target(client, target)
+            progress("正在事务内清空当前原理图页…")
+            deleted = client.clear_schematic_page(context.document)
+            _verify_target(client, target)
+            commit_attempted = True
+            client.end_commit(commit_id, commit=True, message="RF EDA clear current schematic page")
+        except Exception as exc:
+            if commit_attempted or commit_id is None:
+                raise GenerationUncertain("图页清空结果未获确认；请在 KiCad 核验后再操作。") from exc
+            try:
+                if isinstance(exc, ApiTransportError):
+                    client.reconnect_for_verification()
+                client.end_commit(commit_id, commit=False)
+            except Exception as rollback_error:
+                raise GenerationUncertain("清空失败，且无法确认事务已撤销；请核验当前图页。") from rollback_error
+            if isinstance(exc, ApiError):
+                exc.rollback_confirmed = True
+                raise
+            error = ApiError(str(exc), code="KICAD_CLEAR_FAILED")
+            error.rollback_confirmed = True
+            raise error from exc
+        progress(f"当前图页已清空：{deleted} 个对象。")
+        return deleted
+
+
 def generate(graph: GraphIR, progress: Progress, replace: dict | None = None, *,
              require_complete: bool = True, target: dict | None = None,
              previous: dict | None = None, on_checkpoint: Callable[[dict], None] | None = None,

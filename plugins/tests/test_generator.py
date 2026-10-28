@@ -9,7 +9,7 @@ from schematic import schematic_commands_pb2 as library, schematic_types_pb2 as 
 
 from ai_schematic.api_client import ApiCapabilityError, ApiError, ApiTransportError, KiCadClient
 from ai_schematic.generator import (GenerationUncertain, adopt_legacy_placement,
-                                    capture_target, clear_graph_selection, generate,
+                                    capture_target, clear_current_page, clear_graph_selection, generate,
                                     prepare_feedback, select_graph_objects, verify_uncertain)
 from ai_schematic.graph_ir import GraphIR
 from ai_schematic.routing import rotate, rotated_bounds
@@ -168,6 +168,24 @@ class GeneratorTests(unittest.TestCase):
         mock = self.patch.start()
         mock.require_success = KiCadClient.require_success
         self.addCleanup(self.patch.stop)
+
+    def test_clear_only_removes_current_page_in_one_commit(self):
+        target = capture_target(readback=False)
+        self.client.objects["old"] = sch.Line()
+        self.assertEqual(clear_current_page(target, lambda _: None,
+                                            on_checkpoint=lambda _: None), 1)
+        self.assertEqual(self.client.objects, {})
+        self.assertEqual(self.client.ends, [True])
+
+    def test_unsupported_clear_rolls_back(self):
+        target = capture_target(readback=False)
+        self.client.objects["old"] = sch.Line()
+        self.client.clear_unsupported = True
+        with self.assertRaises(ApiCapabilityError) as error:
+            clear_current_page(target, lambda _: None, on_checkpoint=lambda _: None)
+        self.assertTrue(error.exception.rollback_confirmed)
+        self.assertIn("old", self.client.objects)
+        self.assertEqual(self.client.ends, [False])
 
     def test_import_snapshot_and_duplicate_are_safe_noop(self):
         target = capture_target()

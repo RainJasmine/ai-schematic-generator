@@ -111,6 +111,9 @@ class UIWorkflow:
     def apply_current_graph(self, *, stop_event=None):
         UIClient.requests.append((self.service, self.client.token, "apply"))
 
+    def clear_current_page(self, *, stop_event=None):
+        UIClient.requests.append((self.service, self.client.token, "clear_page"))
+
     def revise(self, instruction, *, stop_event=None):
         UIClient.requests.append((self.service, self.client.token, "revision", instruction))
         return None
@@ -341,6 +344,13 @@ class UiTests(unittest.TestCase):
             self.assertEqual(UIClient.requests, [])
             self.window.buttons["apply"].click()
         self.assertEqual(UIClient.requests, [(A, "", "apply")])
+
+    def test_default_button_clears_page_without_a_graph(self):
+        self.assertTrue(self.window.buttons["apply"].isEnabled())
+        self.assertEqual(self.window.buttons["apply"].text(), "清空当前图页")
+        with patch.object(self.window, "launch", side_effect=self.run_sync):
+            self.window.buttons["apply"].click()
+        self.assertEqual(UIClient.requests, [(A, "", "clear_page")])
 
     def test_generated_result_enables_manual_update_without_automatic_canvas_call(self):
         self.seed(A, OLD_ID)

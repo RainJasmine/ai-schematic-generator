@@ -16,7 +16,10 @@ def package(root: Path, output: Path | None = None) -> Path:
     paths.append(root / "docs/手动更新与清空图页接口.md")
     for folder in ("plugins", "resources"):
         for path in (root / folder).rglob("*"):
-            if path.is_file() and "__pycache__" not in path.parts and path.suffix.lower() in {".py", ".png", ".svg", ".proto"}:
+            relative = path.relative_to(root)
+            if (path.is_file() and "__pycache__" not in relative.parts
+                    and relative.parts[:2] != ("plugins", "tests")
+                    and path.suffix.lower() in {".py", ".png", ".svg", ".proto"}):
                 paths.append(path)
     required = ("workflow.py", "snapshot.py", "session_store.py", "management_ui.py", "requirements_ui.py")
     if any(not (root / "plugins/ai_schematic" / name).is_file() for name in required):

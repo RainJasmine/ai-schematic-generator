@@ -1,6 +1,6 @@
 # RF EDA · AI 原理图设计助手
 
-版本 **0.2.4**，基于 `dev / 390d2ef`。Python 3.10+；AI 服务 API 1.x、Graph IR `ai-eda-graph-ir/v2.0`。
+版本 **0.2.5**。Python 3.10+；AI 服务 API 1.x、Graph IR `ai-eda-graph-ir/v2.0`。
 
 本版采用 **仅后端反馈 + 手动更新原理图**。首轮和反馈成功后先保存设计结果，不操作画布；用户点击统一“更新原理图”按钮后，才清空当前页并重新解析 Graph IR、创建符号和导线。**不读取图纸快照、不审阅或合并人工改图、不要求画布与后端对齐。**
 
@@ -55,7 +55,7 @@ Graph IR 的解析、布局、布线由插件完成，KiCad 无需新增“接�
 
 ## 安装与运行条件
 
-运行 `python tools/package_plugin.py`，生成 `dist/rf-eda-ai-schematic-0.2.4.zip`，通过 KiCad PCM 安装。插件标识仍为 `org.rfeda.ai-schematic-generator`；升级后关闭旧插件窗口再重新打开，源码更新不会自动替换已安装副本。旧的其他标识安装应卸载，避免运行错误副本。
+运行 `python tools/package_plugin.py`，生成 `dist/rf-eda-ai-schematic-0.2.5.zip`，通过 KiCad PCM 安装。插件标识仍为 `org.rfeda.ai-schematic-generator`；升级后关闭旧插件窗口再重新打开，源码更新不会自动替换已安装副本。旧的其他标识安装应卸载，避免运行错误副本。
 
 依赖由 KiCad 插件环境安装，亦可在对应 Python 环境执行 `python -m pip install -r plugins/requirements.txt`。本版没有新增 WebView 依赖。`KICAD_API_SOCKET`、`KICAD_API_TOKEN` 由编辑器注入，不是 AI 服务令牌。
 
@@ -74,6 +74,8 @@ AI 服务需要支持 `/api/v1/capabilities` 的 `revision.canvas_policies` 包�
 7. “结束本轮”只保存在本地，不调用模型或不存在的 finish 接口。“继续反馈”重新开启输入；不要求先更新画布。
 
 本地 Graph IR 从任务页导入，也先保留为待应用结果，不立即写图。后端当前版本和画布已应用版本分别显示；可在尚未绘图时进行多轮讨论。清空失败或绘图失败保留后端结果，可修复接口后再次应用，不需要重跑 AI。
+
+尚无待应用 Graph IR 时，主操作显示 **清空当前图页**。确认后只删除当前活动图页的全部对象，不生成新图；此操作同样需要宿主支持整页清空及事务回滚。
 
 ## 记录如何清除
 

@@ -190,6 +190,35 @@ class ClientWorkflow:
                   applied_revision=(success.get("baseline") or {}).get("revision"))
         return result
 
+    def clear_current_page(self, *, stop_event=None):
+        """User-requested clear with no AI graph; retain a journal for unknown IPC results."""
+        self.check_waiting(stop_event)
+        if (self.state.get("pending") or self.state.get("uncertain")
+                or self.state.get("operation", {}).get("job", {}).get("status") in ("queued", "running")):
+            raise ValueError("请先处理运行中或结果待确认的操作，再清空当前图页")
+        target = self.canvas.capture_target(readback=False)
+        self.save(target=target)
+        checkpoint_written = False
+
+        def checkpoint(value):
+            nonlocal checkpoint_written
+            self.save(uncertain=True, mutation_checkpoint=value)
+            checkpoint_written = True
+            self.event({"type": "mutation"})
+
+        try:
+            deleted = self.canvas.clear_current_page(target, self.log,
+                                                     on_checkpoint=checkpoint)
+        except Exception as exc:
+            if checkpoint_written and (getattr(exc, "rollback_verified", False)
+                                       or getattr(exc, "rollback_confirmed", False)):
+                self.save(uncertain=False, mutation_checkpoint=None)
+            raise
+        self.save(uncertain=False, mutation_checkpoint=None, **{"import": {},
+                  "applied_job_id": None, "applied_graph_hash": None,
+                  "applied_revision": None})
+        return {"cleared": True, "deleted_items_count": deleted}
+
     def import_graph(self, graph, target, stop_event):
         if self.state.get("uncertain"):
             raise ValueError("上次图纸事务尚未核验，不能重复导入")

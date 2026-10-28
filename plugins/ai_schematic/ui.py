@@ -211,7 +211,12 @@ class GeneratorWindow(QMainWindow):
         self.buttons["start"].setEnabled(bool(idle and (not success or state.get("new_design")) and (self.path.text() or text) and len(text) <= 20000))
         self.buttons["new"].setEnabled(idle)
         self.buttons["json"].setEnabled(idle)
-        self.buttons["apply"].setEnabled(bool(idle and not state.get("uncertain") and (success.get("graph") or state.get("local_graph"))))
+        has_graph = bool(success.get("graph") or state.get("local_graph"))
+        self.buttons["apply"].setText("更新原理图" if has_graph else "清空当前图页")
+        self.buttons["apply"].setToolTip(
+            "清空当前图页并按已有设计结果重绘" if has_graph else
+            "当前没有待应用的设计图；点击后仅清空当前活动图页")
+        self.buttons["apply"].setEnabled(bool(idle and not state.get("uncertain")))
         self.buttons["remove_file"].setEnabled(bool(self.path.text()))
         self.buttons["clear_records"].setEnabled(idle and not state.get("uncertain"))
         self.buttons["operation_report"].setEnabled(bool(job.get("report_url")))
@@ -560,6 +565,17 @@ class GeneratorWindow(QMainWindow):
 
     def update_schematic(self):
         if not self.switch_service():
+            return
+        has_graph = bool((self.workflow.state.get("success") or {}).get("graph")
+                         or self.workflow.state.get("local_graph"))
+        if not has_graph:
+            answer = QMessageBox.question(
+                self, "清空当前图页",
+                "当前没有可应用的设计图。将仅删除当前活动原理图页上的全部内容，"
+                "包括人工绘制的对象；不会生成新图或删除其他图页。是否清空？")
+            if answer == QMessageBox.StandardButton.Yes:
+                self.launch(lambda task: self.workflow.clear_current_page(
+                    stop_event=task.stop_event), "正在清空当前原理图页…")
             return
         answer = QMessageBox.question(self, "更新原理图", "将清空当前活动原理图页的全部旧内容，并按当前后端 Graph IR 重新绘制。人工改动不会保留，也不会传给 AI。是否更新？")
         if answer == QMessageBox.StandardButton.Yes:
